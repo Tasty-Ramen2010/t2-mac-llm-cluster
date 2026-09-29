@@ -1,0 +1,2833 @@
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 2765c27..b272fc9 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -81,6 +81,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         target_link_libraries(${GGML_CPU_NAME} PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
+     endif()
+ 
++    if (GGML_CPU_IGPU)
++        # Intel iGPU co-worker for Q4_0 GEMV (OpenCL, zero copy); runtime switch GGML_IGPU=<fraction>
++        find_package(OpenCL REQUIRED)
++        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_IGPU)
++        target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenCL::OpenCL)
++        list(APPEND GGML_CPU_SOURCES ggml-cpu/igpu.cpp ggml-cpu/igpu.h)
++    endif()
++
+     if (GGML_LLAMAFILE)
+         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LLAMAFILE)
+ 
+diff --git a/ggml/src/ggml-cpu/arch/x86/repack.cpp b/ggml/src/ggml-cpu/arch/x86/repack.cpp
+index af1ceba..e876cb1 100644
+--- a/ggml/src/ggml-cpu/arch/x86/repack.cpp
++++ b/ggml/src/ggml-cpu/arch/x86/repack.cpp
+@@ -14,6 +14,8 @@
+ #include <cassert>
+ #include <cstdlib> // for qsort
+ #include <cstdio>  // for GGML_ASSERT
++#include <vector>
++#include <algorithm>
+ 
+ #define GGML_CPU_CLANG_WORKAROUND
+ #include "../../repack.h"
+@@ -636,6 +638,86 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t
+     }
+ }
+ 
++// Lean GEMV for q4_0x8 / mxfp4x8 (single token decode; memory-bound on small CPUs, so every uop counts).
++// vs gemv_q4_b32_8x8_q8_0_lut_avx: unsigned LUT (value + OFF) so maddubs needs no sign fix-ups -- the exact
++// correction -OFF*sum(a) is preloaded into the int accumulator; four maddubs are summed in int16 before one
++// madd (max 4*2*24*127 < 32767); activations are broadcast straight from memory (load port, not the shuffle
++// port); e8m0 scales are decoded as a vector. GGML_LEAN_GEMV=0 falls back to the original kernel.
++static bool ggml_lean_gemv_enabled() {
++    static const bool on = [] { const char * e = getenv("GGML_LEAN_GEMV"); return !(e && e[0] == '0'); }();
++    return on;
++}
++
++template<typename block_tx8, int OFF>
++static void gemv_b32_8x8_q8_0_lean_avx2(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i ulut) {
++    const int nb = n / QK8_0;
++    UNUSED(bs);
++    const __m256i finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
++    const __m256i m4b    = _mm256_set1_epi8(0x0F);
++    const __m256i ones16 = _mm256_set1_epi16(1);
++    const __m256i ones8  = _mm256_set1_epi8(1);
++    const __m256i eperm  = _mm256_set_epi32(7, 3, 6, 2, 5, 1, 4, 0);
++    const block_tx8  * b_ptr_start = (const block_tx8  *)vx;
++    const block_q8_0 * a_ptr_start = (const block_q8_0 *)vy;
++
++    int32_t corr[512];   // -OFF * sum(a) per activation block
++    for (int64_t y = 0; y < nr; y++) {
++        const block_q8_0 * a_ptr = a_ptr_start + (y * nb);
++        for (int b = 0; b < nb; b++) {
++            const __m256i a = _mm256_loadu_si256((const __m256i *)a_ptr[b].qs);
++            __m256i t = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, a), ones16);
++            __m128i h = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
++            h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0x4E));
++            h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0xB1));
++            corr[b] = -OFF * _mm_cvtsi128_si32(h);
++        }
++        for (int64_t x = 0; x < nc / 8; x++) {
++            const block_tx8 * b_ptr = b_ptr_start + (x * nb);
++            __m256 acc_row = _mm256_setzero_ps();
++            for (int64_t b = 0; b < nb; b++) {
++                const __m256i r0 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs));
++                const __m256i r1 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 1);
++                const __m256i r2 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 2);
++                const __m256i r3 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 3);
++                const __m256i w0123_0 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(r0, m4b));
++                const __m256i w4567_0 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(r1, m4b));
++                const __m256i w0123_1 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(r2, m4b));
++                const __m256i w4567_1 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(r3, m4b));
++                const __m256i w0123_2 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(_mm256_srli_epi16(r0, 4), m4b));
++                const __m256i w4567_2 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(_mm256_srli_epi16(r1, 4), m4b));
++                const __m256i w0123_3 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(_mm256_srli_epi16(r2, 4), m4b));
++                const __m256i w4567_3 = _mm256_shuffle_epi8(ulut, _mm256_and_si256(_mm256_srli_epi16(r3, 4), m4b));
++
++                const int32_t * aq = (const int32_t *) a_ptr[b].qs;
++                #define LEAN_MUL(wA, wB, k) \
++                    _mm256_maddubs_epi16(_mm256_blend_epi32(wA, _mm256_shuffle_epi32(wB, 177), 170), _mm256_set1_epi32(aq[k])), \
++                    _mm256_maddubs_epi16(_mm256_blend_epi32(_mm256_shuffle_epi32(wA, 177), wB, 170), _mm256_set1_epi32(aq[k + 1]))
++                const __m256i p[8] = { LEAN_MUL(w0123_0, w4567_0, 0), LEAN_MUL(w0123_1, w4567_1, 2),
++                                       LEAN_MUL(w0123_2, w4567_2, 4), LEAN_MUL(w0123_3, w4567_3, 6) };
++                #undef LEAN_MUL
++                const __m256i s0 = _mm256_add_epi16(_mm256_add_epi16(p[0], p[1]), _mm256_add_epi16(p[2], p[3]));
++                const __m256i s1 = _mm256_add_epi16(_mm256_add_epi16(p[4], p[5]), _mm256_add_epi16(p[6], p[7]));
++                const __m256i iacc = _mm256_add_epi32(_mm256_set1_epi32(corr[b]),
++                                     _mm256_add_epi32(_mm256_madd_epi16(s0, ones16), _mm256_madd_epi16(s1, ones16)));
++
++                __m256 col_scale_f32;
++                if constexpr (std::is_same_v<block_tx8, block_q4_0x8>) {
++                    const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
++                    col_scale_f32 = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
++                } else {
++                    // e8m0 "half": 2^(e-128) == float bits (e-1)<<23 (e <= 1 flushes to 0, a subnormal before)
++                    const __m128i e = _mm_subs_epu8(_mm_loadl_epi64((const __m128i *) b_ptr[b].e), _mm_set1_epi8(1));
++                    col_scale_f32 = _mm256_permutevar8x32_ps(_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu8_epi32(e), 23)), eperm);
++                }
++                const __m256 row_scale_f32 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[b].d));
++                acc_row = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_mul_ps(col_scale_f32, row_scale_f32), acc_row);
++            }
++            acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
++            _mm256_storeu_ps(s + (y * nr + x * 8), acc_row);
++        }
++    }
++}
++
+ // GEMM for 8x blocks of 32 4-bit quants with a single scale factor per block
+ template<typename block_tx8>
+ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i signextendlut) {
+@@ -1452,6 +1534,12 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+         __m256i signextendlut = _mm256_castsi128_si256(_mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+         signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+ 
++        if (ggml_lean_gemv_enabled() && n / QK8_0 <= 512) {
++            __m256i ulut = _mm256_castsi128_si256(_mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8));
++            ulut = _mm256_permute2f128_si256(ulut, ulut, 0);
++            gemv_b32_8x8_q8_0_lean_avx2<block_q4_0x8, 8>(n, s, bs, vx, vy, nr, nc, ulut);
++            return;
++        }
+         gemv_q4_b32_8x8_q8_0_lut_avx<block_q4_0x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+ 
+         return;
+@@ -1461,6 +1549,125 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+     ggml_gemv_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++#if defined(__AVX2__) || defined(__AVX512F__)
++// Lean GEMV for block_q5_0x8 (DeepSeek-V2 / Qwen / Mellum "Q5_0" tensors had no repacked AVX2 kernel at all).
++// Same skeleton as the lean q4_0x8 kernel: the 5-bit value u = low nibble | 5th bit << 4 is unsigned (0..31), so
++// maddubs(u, a) needs no sign tricks and the -16*sum(a) offset is preloaded into the int accumulator; four maddubs
++// fit in int16 (4*2*31*127 = 31496). The 5th bits come from the transposed qh plane: vector v's bit is bit v of each
++// byte, moved to bit 4 with one 16-bit shift and masked with one and.
++static void gemv_q5_0_8x8_q8_0_lean_avx2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    const int nb = n / QK8_0;
++    const __m256i finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
++    const __m256i m4b    = _mm256_set1_epi8(0x0F);
++    const __m256i m10    = _mm256_set1_epi8(0x10);
++    const __m256i ones16 = _mm256_set1_epi16(1);
++    const __m256i ones8  = _mm256_set1_epi8(1);
++    const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
++    const block_q5_0x8 * b_ptr_start = (const block_q5_0x8 *) vx;
++    const block_q8_0   * a_ptr = (const block_q8_0 *) vy;
++
++    int32_t corr[512];   // -16 * sum(a) per activation block
++    for (int b = 0; b < nb; b++) {
++        const __m256i a = _mm256_loadu_si256((const __m256i *) a_ptr[b].qs);
++        __m256i t = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, a), ones16);
++        __m128i h = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
++        h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0x4E));
++        h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0xB1));
++        corr[b] = -16 * _mm_cvtsi128_si32(h);
++    }
++    for (int64_t x = 0; x < nc / 8; x++) {
++        const block_q5_0x8 * b_ptr = b_ptr_start + (x * nb);
++        __m256 acc_row = _mm256_setzero_ps();
++        for (int64_t b = 0; b < nb; b++) {
++            const __m256i r0 = _mm256_loadu_si256((const __m256i *) (b_ptr[b].qs));
++            const __m256i r1 = _mm256_loadu_si256((const __m256i *) (b_ptr[b].qs) + 1);
++            const __m256i r2 = _mm256_loadu_si256((const __m256i *) (b_ptr[b].qs) + 2);
++            const __m256i r3 = _mm256_loadu_si256((const __m256i *) (b_ptr[b].qs) + 3);
++            const __m256i H  = _mm256_loadu_si256((const __m256i *) (b_ptr[b].qh));
++            const __m256i w0123_0 = _mm256_or_si256(_mm256_and_si256(r0, m4b), _mm256_and_si256(_mm256_slli_epi16(H, 4), m10));
++            const __m256i w4567_0 = _mm256_or_si256(_mm256_and_si256(r1, m4b), _mm256_and_si256(_mm256_slli_epi16(H, 3), m10));
++            const __m256i w0123_1 = _mm256_or_si256(_mm256_and_si256(r2, m4b), _mm256_and_si256(_mm256_slli_epi16(H, 2), m10));
++            const __m256i w4567_1 = _mm256_or_si256(_mm256_and_si256(r3, m4b), _mm256_and_si256(_mm256_slli_epi16(H, 1), m10));
++            const __m256i w0123_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(r0, 4), m4b), _mm256_and_si256(H, m10));
++            const __m256i w4567_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(r1, 4), m4b), _mm256_and_si256(_mm256_srli_epi16(H, 1), m10));
++            const __m256i w0123_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(r2, 4), m4b), _mm256_and_si256(_mm256_srli_epi16(H, 2), m10));
++            const __m256i w4567_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(r3, 4), m4b), _mm256_and_si256(_mm256_srli_epi16(H, 3), m10));
++
++            const int32_t * aq = (const int32_t *) a_ptr[b].qs;
++            #define LEAN_MUL(wA, wB, k) \
++                _mm256_maddubs_epi16(_mm256_blend_epi32(wA, _mm256_shuffle_epi32(wB, 177), 170), _mm256_set1_epi32(aq[k])), \
++                _mm256_maddubs_epi16(_mm256_blend_epi32(_mm256_shuffle_epi32(wA, 177), wB, 170), _mm256_set1_epi32(aq[k + 1]))
++            const __m256i p[8] = { LEAN_MUL(w0123_0, w4567_0, 0), LEAN_MUL(w0123_1, w4567_1, 2),
++                                   LEAN_MUL(w0123_2, w4567_2, 4), LEAN_MUL(w0123_3, w4567_3, 6) };
++            #undef LEAN_MUL
++            const __m256i s0 = _mm256_add_epi16(_mm256_add_epi16(p[0], p[1]), _mm256_add_epi16(p[2], p[3]));
++            const __m256i s1 = _mm256_add_epi16(_mm256_add_epi16(p[4], p[5]), _mm256_add_epi16(p[6], p[7]));
++            const __m256i iacc = _mm256_add_epi32(_mm256_set1_epi32(corr[b]),
++                                 _mm256_add_epi32(_mm256_madd_epi16(s0, ones16), _mm256_madd_epi16(s1, ones16)));
++            const __m256 col_scale_f32 = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
++            const __m256 row_scale_f32 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[b].d));
++            acc_row = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_mul_ps(col_scale_f32, row_scale_f32), acc_row);
++        }
++        acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
++        _mm256_storeu_ps(s + x * 8, acc_row);
++    }
++}
++#endif
++
++// GGML_Q5X8_CHECK=1: compare the AVX2 kernel with the plain C reference on the first calls and report the worst error
++static void q5x8_selfcheck(int n, const float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, bool is_gemm) {
++    static int left = -1;
++    if (left < 0) { const char * e = getenv("GGML_Q5X8_CHECK"); left = (e && e[0] == '1') ? 40 : 0; }
++    if (left <= 0) return;
++    left--;
++    std::vector<float> ref((size_t) (is_gemm ? nr * bs : nc));
++    if (is_gemm) ggml_gemm_q5_0_8x8_q8_0_generic(n, ref.data(), bs, vx, vy, nr, nc);
++    else         ggml_gemv_q5_0_8x8_q8_0_generic(n, ref.data(), bs, vx, vy, nr, nc);
++    double worst = 0, scale = 1e-6;
++    for (int m = 0; m < (is_gemm ? nr : 1); m++)
++        for (int c = 0; c < nc; c++) {
++            const float a = s[m * (is_gemm ? bs : 0) + c], b = ref[m * (is_gemm ? bs : 0) + c];
++            worst = std::max(worst, (double) std::fabs(a - b));
++            scale = std::max(scale, (double) std::fabs(b));
++        }
++    fprintf(stderr, "q5_0x8 %s check: n=%d nc=%d nr=%d max |fast-ref| = %.3g (rel %.3g)\n", is_gemm ? "gemm" : "gemv", n, nc, nr, worst, worst / scale);
++}
++
++void ggml_gemv_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++    gemv_q5_0_8x8_q8_0_lean_avx2(n, s, vx, vy, nc);
++    q5x8_selfcheck(n, s, bs, vx, vy, nr, nc, false);
++#else
++    ggml_gemv_q5_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
++#endif
++}
++
++// prompt batches: 4 activation rows arrive interleaved (block_q8_0x4, 8-byte chunks); split them and run the gemv per row
++void ggml_gemm_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++    const int nb = n / QK8_0;
++    std::vector<block_q8_0> rows((size_t) 4 * nb);
++    for (int y = 0; y < nr / 4; y++) {
++        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
++        for (int l = 0; l < nb; l++) {
++            for (int m = 0; m < 4; m++) {
++                block_q8_0 & r = rows[(size_t) m * nb + l];
++                r.d = a_ptr[l].d[m];
++                for (int c = 0; c < 4; c++) {       // chunk c holds weights (c>>1)*16 + (c&1)*8 .. +8 of row m
++                    memcpy(r.qs + (c >> 1) * 16 + (c & 1) * 8, a_ptr[l].qs + c * 32 + m * 8, 8);
++                }
++            }
++        }
++        for (int m = 0; m < 4; m++) {
++            gemv_q5_0_8x8_q8_0_lean_avx2(n, s + (size_t) (y * 4 + m) * bs, vx, rows.data() + (size_t) m * nb, nc);
++        }
++    }
++    q5x8_selfcheck(n, s, bs, vx, vy, nr, nc, true);
++#else
++    ggml_gemm_q5_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
++#endif
++}
++
+ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+     const int qk = QK_K;
+     const int nb = n / qk;
+@@ -1702,6 +1909,13 @@ void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
+     __m256i signextendlut = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)kvalues_mxfp4));
+     signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+ 
++    if (ggml_lean_gemv_enabled() && n / QK8_0 <= 512) {
++        static const int8_t kvalues_mxfp4_u[16] = {12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0};  // kvalues_mxfp4 + 12
++        __m256i ulut = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) kvalues_mxfp4_u));
++        ulut = _mm256_permute2f128_si256(ulut, ulut, 0);
++        gemv_b32_8x8_q8_0_lean_avx2<block_mxfp4x8, 12>(n, s, bs, vx, vy, nr, nc, ulut);
++        return;
++    }
+     gemv_q4_b32_8x8_q8_0_lut_avx<block_mxfp4x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+ 
+     return;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 046f17c..6c9efea 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1646,7 +1646,12 @@ static void ggml_compute_forward_mul_mat_id(
+             for (int id = 0; id < n_ids; ++id) {
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+ 
+-                assert(i02 >= 0 && i02 < n_as);
++                if (i02 < 0) {
++                    // skipped expert (expert parallelism): output row is zero
++                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
++                    continue;
++                }
++                assert(i02 < n_as);
+ 
+                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                 matrix_row_counts[i02] += 1;
+@@ -3092,6 +3097,32 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// GGML_CPU_OPPROF=1: thread 0 times every node (compute + barrier wait), grouped by op / weight name, printed at exit
++struct opprof_ent { char key[96]; double ms; long n; };
++static struct opprof_ent opprof_tab[256];
++static int opprof_n = 0, opprof_on = -1;
++static double opprof_total = 0;
++static void opprof_dump(void) {
++    for (int i = 0; i < opprof_n; i++) for (int j = i + 1; j < opprof_n; j++)
++        if (opprof_tab[j].ms > opprof_tab[i].ms) { struct opprof_ent t = opprof_tab[i]; opprof_tab[i] = opprof_tab[j]; opprof_tab[j] = t; }
++    fprintf(stderr, "opprof: total %.1f ms in graph nodes\n", opprof_total);
++    for (int i = 0; i < opprof_n && i < 40; i++)
++        fprintf(stderr, "opprof: %6.1f%% %9.1f ms %8ld  %s\n", 100 * opprof_tab[i].ms / opprof_total, opprof_tab[i].ms, opprof_tab[i].n, opprof_tab[i].key);
++}
++static void opprof_add(const struct ggml_tensor * node, int n_fused, double ms) {
++    char key[96];
++    const struct ggml_tensor * w = node->src[0];
++    const char * wn = w ? w->name : "";
++    if (strncmp(wn, "blk.", 4) == 0) { const char * d = strchr(wn + 4, '.'); if (d) wn = d + 1; }
++    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GET_ROWS) && w)
++        snprintf(key, sizeof(key), "%s %s [%s]%s", ggml_op_desc(node), wn, ggml_type_name(w->type), n_fused ? " +fused" : "");
++    else
++        snprintf(key, sizeof(key), "%s%s", ggml_op_desc(node), n_fused ? " +fused" : "");
++    opprof_total += ms;
++    for (int i = 0; i < opprof_n; i++) if (strcmp(opprof_tab[i].key, key) == 0) { opprof_tab[i].ms += ms; opprof_tab[i].n++; return; }
++    if (opprof_n < 256) { strcpy(opprof_tab[opprof_n].key, key); opprof_tab[opprof_n].ms = ms; opprof_tab[opprof_n].n = 1; opprof_n++; }
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3134,6 +3165,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
++        if (state->ith == 0 && opprof_on < 0) { opprof_on = getenv("GGML_CPU_OPPROF") != NULL; if (opprof_on) atexit(opprof_dump); }
++        const int64_t opprof_t0 = (opprof_on > 0 && state->ith == 0) ? ggml_time_us() : 0;
++        struct ggml_tensor * opprof_node = node;
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+         if (n_fused > 0) {
+             node_n += n_fused;
+@@ -3150,6 +3184,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (opprof_t0) opprof_add(opprof_node, n_fused, (ggml_time_us() - opprof_t0) / 1000.0);
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+diff --git a/ggml/src/ggml-cpu/igpu.cpp b/ggml/src/ggml-cpu/igpu.cpp
+new file mode 100644
+index 0000000..e1695b6
+--- /dev/null
++++ b/ggml/src/ggml-cpu/igpu.cpp
+@@ -0,0 +1,485 @@
++// Intel iGPU co-worker for single-token Q4_0 GEMV (see igpu.h).
++#define CL_TARGET_OPENCL_VERSION 300
++#include "igpu.h"
++
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <CL/cl.h>
++
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <mutex>
++#include <vector>
++
++namespace {
++
++const char * k_src = R"CLC(
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++// block_q4_0x8: 8 fp16 scales, then 128 bytes: row r's bytes 0-7 at r*8, bytes 8-15 at 64+r*8 (nibbles xor 8, i.e.
++// two's complement 4-bit). Byte j of a row holds element j (low nibble) and j+16 (high nibble).
++// One 16-lane subgroup per group of 8 rows, lanes stride over blocks, x staged in local memory.
++__attribute__((intel_reqd_sub_group_size(16)))
++__kernel void gemv_q4x8(__global const uchar * Wb, ulong woff, __global const uchar * Xb, ulong xoff,
++                        __global uchar * Yb, ulong yoff, int nb, __local float * xs) {
++    __global const uchar * W = Wb + woff;
++    __global const float * x = (__global const float *)(Xb + xoff);
++    __global float * y = (__global float *)(Yb + yoff);
++    const int K = nb * 32;
++    for (int i = get_local_id(0); i < K; i += get_local_size(0)) xs[i] = x[i];
++    barrier(CLK_LOCAL_MEM_FENCE);
++    const int lane = get_sub_group_local_id();
++    const int g = get_group_id(0) * get_num_sub_groups() + get_sub_group_id();
++    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    for (int b = lane; b < nb; b += 16) {
++        __global const uchar * blk = W + ((size_t)g * nb + b) * 144;
++        const float8 d = vload_half8(0, (__global const half *)blk);
++        __local const float * xb = xs + b * 32;
++        const float8 x0 = vload8(0, xb), x1 = vload8(1, xb), x2 = vload8(2, xb), x3 = vload8(3, xb);
++        const uchar16 qa = vload16(0, blk + 16), qb = vload16(1, blk + 16), qc = vload16(2, blk + 16), qd = vload16(3, blk + 16);
++        const uchar16 qe = vload16(4, blk + 16), qf = vload16(5, blk + 16), qg = vload16(6, blk + 16), qh = vload16(7, blk + 16);
++#define ROW(r, A, B) { \
++            const uchar8 u = (r & 1) ? A.hi : A.lo, v = (r & 1) ? B.hi : B.lo; \
++            const float8 l0 = convert_float8(as_char8(u << (uchar8)4) >> (char8)4), h0 = convert_float8(as_char8(u) >> (char8)4); \
++            const float8 l1 = convert_float8(as_char8(v << (uchar8)4) >> (char8)4), h1 = convert_float8(as_char8(v) >> (char8)4); \
++            const float8 p = l0 * x0 + l1 * x1 + h0 * x2 + h1 * x3; \
++            acc[r] += d[r] * (p.s0 + p.s1 + p.s2 + p.s3 + p.s4 + p.s5 + p.s6 + p.s7); }
++        ROW(0, qa, qe) ROW(1, qa, qe) ROW(2, qb, qf) ROW(3, qb, qf) ROW(4, qc, qg) ROW(5, qc, qg) ROW(6, qd, qh) ROW(7, qd, qh)
++    }
++    for (int r = 0; r < 8; r++) { const float t = sub_group_reduce_add(acc[r]); if (lane == r) y[g * 8 + r] = t; }
++}
++)CLC";
++
++constexpr int    SUBGROUPS = 8;               // per work-group -> 64 rows per work-group
++#define CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL (1 << 23)   // lets one zero-copy buffer exceed the ~3.3 GiB max alloc
++
++struct window { const char * base; size_t size; cl_mem mem; };
++
++struct state {
++    bool             ok = false;
++    float            frac = 0.0f;
++    int64_t          min_rows = 2048;
++    cl_context       ctx = nullptr;
++    cl_command_queue q = nullptr;
++    cl_kernel        k = nullptr;
++    std::vector<window> wins;
++    std::mutex       mu;
++};
++
++state & S() {
++    static state s;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        const char * e = getenv("GGML_IGPU");
++        if (!e || atof(e) <= 0) return;
++        s.frac = (float) atof(e);
++        if (const char * m = getenv("GGML_IGPU_MIN_ROWS")) s.min_rows = atoll(m);
++        cl_platform_id p; cl_device_id d; cl_int err;
++        if (clGetPlatformIDs(1, &p, nullptr) != CL_SUCCESS || clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 1, &d, nullptr) != CL_SUCCESS) {
++            fprintf(stderr, "ggml-igpu: no OpenCL GPU, disabled\n"); return;
++        }
++        s.ctx = clCreateContext(nullptr, 1, &d, nullptr, nullptr, &err);
++        s.q   = clCreateCommandQueueWithProperties(s.ctx, d, nullptr, &err);
++        cl_program pr = clCreateProgramWithSource(s.ctx, 1, &k_src, nullptr, &err);
++        if (clBuildProgram(pr, 1, &d, "-cl-std=CL2.0 -cl-mad-enable -cl-intel-greater-than-4GB-buffer-required", nullptr, nullptr) != CL_SUCCESS) {
++            static char log[16384]; clGetProgramBuildInfo(pr, d, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
++            fprintf(stderr, "ggml-igpu: kernel build failed:\n%s\n", log); return;
++        }
++        s.k = clCreateKernel(pr, "gemv_q4x8", &err);
++        s.ok = err == CL_SUCCESS;
++        char name[256] = {0}; clGetDeviceInfo(d, CL_DEVICE_NAME, sizeof(name), name, nullptr);
++        fprintf(stderr, "ggml-igpu: %s takes %.0f%% of rows of Q4_0 GEMVs with >= %lld rows\n", name, s.frac * 100, (long long) s.min_rows);
++    });
++    return s;
++}
++
++// zero-copy cl_mem covering [p, p+n) of the backend buffer holding tensor t; *off = p - window start
++cl_mem window_for(const ggml_tensor * t, const void * pv, size_t n, size_t * off) {
++    auto & s = S();
++    const char * p = (const char *) pv;
++    std::lock_guard<std::mutex> lock(s.mu);
++    for (auto & w : s.wins) {
++        if (p >= w.base && p + n <= w.base + w.size) { *off = p - w.base; return w.mem; }
++    }
++    // one window per whole backend buffer: the Intel driver aborts on overlapping host-pointer buffers
++    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
++    if (!buf) return nullptr;
++    const char * start = (const char *) ggml_backend_buffer_get_base(buf);
++    const size_t size  = ggml_backend_buffer_get_size(buf) / 64 * 64;
++    if (((uintptr_t) start & 4095) != 0 || p < start || p + n > start + size) return nullptr;  // zero copy needs page alignment
++    cl_int err;
++    cl_mem m = clCreateBuffer(s.ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL, size, (void *) start, &err);
++    if (err != CL_SUCCESS) { fprintf(stderr, "ggml-igpu: zero-copy buffer of %zu MB failed (%d)\n", size >> 20, err); return nullptr; }
++    s.wins.push_back({start, size, m});
++    *off = p - start;
++    return m;
++}
++
++} // namespace
++
++extern "C" int64_t ggml_igpu_q4x8_rows(const ggml_tensor * src0, const ggml_tensor * src1) {
++    auto & s = S();
++    if (!s.ok || src1->ne[1] != 1 || src1->ne[2] != 1 || src0->ne[1] < s.min_rows || src0->ne[0] > 16384) return 0;
++    return (int64_t) (src0->ne[1] * s.frac) / (8 * SUBGROUPS) * (8 * SUBGROUPS);
++}
++
++extern "C" void * ggml_igpu_q4x8_launch(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int64_t rows) {
++    auto & s = S();
++    const int nb = (int) (src0->ne[0] / 32);
++    size_t woff, xoff, yoff;
++    const size_t wbytes = (size_t) rows / 8 * nb * 144;          // block_q4_0x8 = 144 bytes per 8 rows x 32 columns
++    cl_mem W = window_for(src0, src0->data, wbytes, &woff);
++    cl_mem X = window_for(src1, src1->data, src0->ne[0] * sizeof(float), &xoff);
++    cl_mem Y = window_for(dst, dst->data, rows * sizeof(float), &yoff);
++    if (!W || !X || !Y) return nullptr;
++    cl_ulong wo = woff, xo = xoff, yo = yoff;
++    clSetKernelArg(s.k, 0, sizeof(cl_mem), &W); clSetKernelArg(s.k, 1, sizeof(cl_ulong), &wo);
++    clSetKernelArg(s.k, 2, sizeof(cl_mem), &X); clSetKernelArg(s.k, 3, sizeof(cl_ulong), &xo);
++    clSetKernelArg(s.k, 4, sizeof(cl_mem), &Y); clSetKernelArg(s.k, 5, sizeof(cl_ulong), &yo);
++    clSetKernelArg(s.k, 6, sizeof(int), &nb);   clSetKernelArg(s.k, 7, (size_t) nb * 32 * sizeof(float), nullptr);
++    const size_t ls = 16 * SUBGROUPS, gs = (size_t) rows / 8 * 16;
++    cl_event ev = nullptr;
++    if (clEnqueueNDRangeKernel(s.q, s.k, 1, nullptr, &gs, &ls, 0, nullptr, &ev) != CL_SUCCESS) return nullptr;
++    clFlush(s.q);
++    return ev;
++}
++
++extern "C" void ggml_igpu_wait(void * handle) {
++    if (!handle) return;
++    cl_event ev = (cl_event) handle;
++    clWaitForEvents(1, &ev);
++    clReleaseEvent(ev);
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// iGPU attention co-worker (decoding, multi-query heads sharing one f16 K/V head, e.g. DeepSeek MLA).
++// GGML_IGPU_ATTN=<fraction>: the iGPU scores the oldest <fraction> of the cached rows while the CPU threads do the
++// rest; the flash-decoding partials (max, sum, sum p*V per head) are merged exactly like the CPU threads' partials.
++// Measured on the UHD 630: as fast as 3 CPU cores on this job, and attention uses little memory bandwidth, so the
++// two can work at the same time. GGML_IGPU_ATTN_MIN (default 1536) = fewest cached rows worth a GPU launch.
++namespace {
++
++const char * a_src = R"CLC(
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++// Multi-query attention for one query token (decoding) -- v6: subgroup broadcasts instead of repeated loads.
++#ifndef H
++#define H 8
++#endif
++#ifndef DK
++#define DK 576
++#endif
++#ifndef DV
++#define DV 512
++#endif
++#define WG (DV / 8)
++#define CHMAX 256
++__attribute__((reqd_work_group_size(WG, 1, 1))) __attribute__((intel_reqd_sub_group_size(8)))
++__kernel void attn_chunk(__global const half * K0, ulong k_off, ulong k_stride, __global const half * V0, ulong v_off, ulong v_stride,
++                         __global const float * Q0, ulong q_off, ulong q_stride, __global const half * mask0, ulong m_off, int has_mask,
++                         float scale, int n_kv, __global float * part, int ch) {
++    __global const half * K = K0 + k_off;
++    __global const half * V = V0 + v_off;
++    __global const float * Q = Q0 + q_off;
++    __global const half * mask = has_mask ? mask0 + m_off : 0;
++    __local float P[H][CHMAX];
++    __local float Ml[H], Sl[H];
++    const int c = get_group_id(0), lid = get_local_id(0), r0 = c * ch;
++    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();
++    // 1) scores: lane = one cached row, all heads; the query comes by block read + register broadcast
++    for (int j = 0; j < ch / WG; j++) {
++        const int rl = j * WG + lid, r = r0 + rl;
++        const bool live = r < n_kv;
++        __global const half * kr = K + (size_t) (live ? r : 0) * k_stride;
++        float acc[H];
++        for (int h = 0; h < H; h++) acc[h] = 0.0f;
++        for (int t = 0; t < DK / 64; t++) {
++            float8 q[H];
++            for (int h = 0; h < H; h++) q[h] = as_float8(intel_sub_group_block_read8((__global const uint *) (Q + h * q_stride + t * 64)));
++            float8 kv;
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 0))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s0, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s0, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s0, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s0, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s0, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s0, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s0, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s0, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s0, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s0, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s0, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s0, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s0, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s0, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s0, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s0, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s0, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s0, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s0, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s0, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s0, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s0, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s0, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s0, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s0, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s0, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s0, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s0, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s0, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s0, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s0, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s0, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s0, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s0, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s0, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s0, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s0, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s0, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s0, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s0, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s0, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s0, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s0, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s0, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s0, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s0, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s0, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s0, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s0, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s0, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s0, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s0, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s0, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s0, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s0, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s0, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s0, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s0, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s0, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s0, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s0, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s0, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s0, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s0, 7), acc[7]);
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 8))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s1, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s1, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s1, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s1, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s1, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s1, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s1, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s1, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s1, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s1, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s1, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s1, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s1, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s1, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s1, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s1, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s1, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s1, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s1, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s1, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s1, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s1, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s1, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s1, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s1, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s1, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s1, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s1, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s1, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s1, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s1, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s1, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s1, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s1, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s1, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s1, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s1, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s1, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s1, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s1, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s1, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s1, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s1, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s1, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s1, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s1, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s1, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s1, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s1, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s1, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s1, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s1, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s1, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s1, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s1, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s1, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s1, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s1, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s1, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s1, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s1, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s1, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s1, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s1, 7), acc[7]);
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 16))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s2, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s2, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s2, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s2, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s2, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s2, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s2, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s2, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s2, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s2, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s2, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s2, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s2, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s2, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s2, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s2, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s2, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s2, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s2, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s2, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s2, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s2, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s2, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s2, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s2, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s2, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s2, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s2, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s2, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s2, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s2, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s2, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s2, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s2, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s2, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s2, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s2, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s2, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s2, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s2, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s2, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s2, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s2, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s2, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s2, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s2, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s2, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s2, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s2, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s2, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s2, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s2, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s2, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s2, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s2, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s2, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s2, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s2, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s2, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s2, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s2, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s2, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s2, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s2, 7), acc[7]);
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 24))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s3, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s3, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s3, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s3, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s3, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s3, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s3, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s3, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s3, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s3, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s3, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s3, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s3, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s3, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s3, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s3, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s3, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s3, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s3, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s3, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s3, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s3, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s3, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s3, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s3, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s3, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s3, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s3, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s3, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s3, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s3, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s3, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s3, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s3, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s3, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s3, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s3, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s3, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s3, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s3, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s3, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s3, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s3, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s3, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s3, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s3, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s3, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s3, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s3, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s3, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s3, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s3, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s3, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s3, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s3, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s3, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s3, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s3, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s3, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s3, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s3, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s3, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s3, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s3, 7), acc[7]);
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 32))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s4, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s4, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s4, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s4, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s4, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s4, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s4, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s4, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s4, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s4, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s4, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s4, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s4, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s4, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s4, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s4, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s4, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s4, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s4, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s4, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s4, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s4, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s4, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s4, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s4, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s4, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s4, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s4, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s4, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s4, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s4, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s4, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s4, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s4, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s4, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s4, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s4, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s4, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s4, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s4, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s4, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s4, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s4, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s4, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s4, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s4, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s4, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s4, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s4, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s4, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s4, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s4, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s4, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s4, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s4, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s4, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s4, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s4, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s4, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s4, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s4, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s4, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s4, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s4, 7), acc[7]);
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 40))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s5, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s5, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s5, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s5, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s5, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s5, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s5, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s5, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s5, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s5, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s5, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s5, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s5, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s5, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s5, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s5, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s5, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s5, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s5, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s5, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s5, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s5, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s5, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s5, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s5, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s5, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s5, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s5, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s5, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s5, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s5, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s5, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s5, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s5, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s5, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s5, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s5, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s5, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s5, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s5, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s5, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s5, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s5, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s5, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s5, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s5, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s5, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s5, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s5, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s5, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s5, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s5, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s5, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s5, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s5, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s5, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s5, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s5, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s5, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s5, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s5, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s5, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s5, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s5, 7), acc[7]);
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 48))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s6, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s6, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s6, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s6, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s6, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s6, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s6, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s6, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s6, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s6, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s6, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s6, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s6, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s6, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s6, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s6, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s6, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s6, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s6, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s6, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s6, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s6, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s6, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s6, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s6, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s6, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s6, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s6, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s6, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s6, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s6, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s6, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s6, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s6, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s6, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s6, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s6, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s6, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s6, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s6, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s6, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s6, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s6, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s6, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s6, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s6, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s6, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s6, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s6, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s6, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s6, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s6, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s6, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s6, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s6, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s6, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s6, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s6, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s6, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s6, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s6, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s6, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s6, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s6, 7), acc[7]);
++            kv = convert_float8(as_half8(vload4(0, (__global const uint *) (kr + t * 64 + 56))));
++            acc[0] = fma(kv.s0, sub_group_broadcast(q[0].s7, 0), acc[0]); acc[1] = fma(kv.s0, sub_group_broadcast(q[1].s7, 0), acc[1]); acc[2] = fma(kv.s0, sub_group_broadcast(q[2].s7, 0), acc[2]); acc[3] = fma(kv.s0, sub_group_broadcast(q[3].s7, 0), acc[3]); acc[4] = fma(kv.s0, sub_group_broadcast(q[4].s7, 0), acc[4]); acc[5] = fma(kv.s0, sub_group_broadcast(q[5].s7, 0), acc[5]); acc[6] = fma(kv.s0, sub_group_broadcast(q[6].s7, 0), acc[6]); acc[7] = fma(kv.s0, sub_group_broadcast(q[7].s7, 0), acc[7]);
++            acc[0] = fma(kv.s1, sub_group_broadcast(q[0].s7, 1), acc[0]); acc[1] = fma(kv.s1, sub_group_broadcast(q[1].s7, 1), acc[1]); acc[2] = fma(kv.s1, sub_group_broadcast(q[2].s7, 1), acc[2]); acc[3] = fma(kv.s1, sub_group_broadcast(q[3].s7, 1), acc[3]); acc[4] = fma(kv.s1, sub_group_broadcast(q[4].s7, 1), acc[4]); acc[5] = fma(kv.s1, sub_group_broadcast(q[5].s7, 1), acc[5]); acc[6] = fma(kv.s1, sub_group_broadcast(q[6].s7, 1), acc[6]); acc[7] = fma(kv.s1, sub_group_broadcast(q[7].s7, 1), acc[7]);
++            acc[0] = fma(kv.s2, sub_group_broadcast(q[0].s7, 2), acc[0]); acc[1] = fma(kv.s2, sub_group_broadcast(q[1].s7, 2), acc[1]); acc[2] = fma(kv.s2, sub_group_broadcast(q[2].s7, 2), acc[2]); acc[3] = fma(kv.s2, sub_group_broadcast(q[3].s7, 2), acc[3]); acc[4] = fma(kv.s2, sub_group_broadcast(q[4].s7, 2), acc[4]); acc[5] = fma(kv.s2, sub_group_broadcast(q[5].s7, 2), acc[5]); acc[6] = fma(kv.s2, sub_group_broadcast(q[6].s7, 2), acc[6]); acc[7] = fma(kv.s2, sub_group_broadcast(q[7].s7, 2), acc[7]);
++            acc[0] = fma(kv.s3, sub_group_broadcast(q[0].s7, 3), acc[0]); acc[1] = fma(kv.s3, sub_group_broadcast(q[1].s7, 3), acc[1]); acc[2] = fma(kv.s3, sub_group_broadcast(q[2].s7, 3), acc[2]); acc[3] = fma(kv.s3, sub_group_broadcast(q[3].s7, 3), acc[3]); acc[4] = fma(kv.s3, sub_group_broadcast(q[4].s7, 3), acc[4]); acc[5] = fma(kv.s3, sub_group_broadcast(q[5].s7, 3), acc[5]); acc[6] = fma(kv.s3, sub_group_broadcast(q[6].s7, 3), acc[6]); acc[7] = fma(kv.s3, sub_group_broadcast(q[7].s7, 3), acc[7]);
++            acc[0] = fma(kv.s4, sub_group_broadcast(q[0].s7, 4), acc[0]); acc[1] = fma(kv.s4, sub_group_broadcast(q[1].s7, 4), acc[1]); acc[2] = fma(kv.s4, sub_group_broadcast(q[2].s7, 4), acc[2]); acc[3] = fma(kv.s4, sub_group_broadcast(q[3].s7, 4), acc[3]); acc[4] = fma(kv.s4, sub_group_broadcast(q[4].s7, 4), acc[4]); acc[5] = fma(kv.s4, sub_group_broadcast(q[5].s7, 4), acc[5]); acc[6] = fma(kv.s4, sub_group_broadcast(q[6].s7, 4), acc[6]); acc[7] = fma(kv.s4, sub_group_broadcast(q[7].s7, 4), acc[7]);
++            acc[0] = fma(kv.s5, sub_group_broadcast(q[0].s7, 5), acc[0]); acc[1] = fma(kv.s5, sub_group_broadcast(q[1].s7, 5), acc[1]); acc[2] = fma(kv.s5, sub_group_broadcast(q[2].s7, 5), acc[2]); acc[3] = fma(kv.s5, sub_group_broadcast(q[3].s7, 5), acc[3]); acc[4] = fma(kv.s5, sub_group_broadcast(q[4].s7, 5), acc[4]); acc[5] = fma(kv.s5, sub_group_broadcast(q[5].s7, 5), acc[5]); acc[6] = fma(kv.s5, sub_group_broadcast(q[6].s7, 5), acc[6]); acc[7] = fma(kv.s5, sub_group_broadcast(q[7].s7, 5), acc[7]);
++            acc[0] = fma(kv.s6, sub_group_broadcast(q[0].s7, 6), acc[0]); acc[1] = fma(kv.s6, sub_group_broadcast(q[1].s7, 6), acc[1]); acc[2] = fma(kv.s6, sub_group_broadcast(q[2].s7, 6), acc[2]); acc[3] = fma(kv.s6, sub_group_broadcast(q[3].s7, 6), acc[3]); acc[4] = fma(kv.s6, sub_group_broadcast(q[4].s7, 6), acc[4]); acc[5] = fma(kv.s6, sub_group_broadcast(q[5].s7, 6), acc[5]); acc[6] = fma(kv.s6, sub_group_broadcast(q[6].s7, 6), acc[6]); acc[7] = fma(kv.s6, sub_group_broadcast(q[7].s7, 6), acc[7]);
++            acc[0] = fma(kv.s7, sub_group_broadcast(q[0].s7, 7), acc[0]); acc[1] = fma(kv.s7, sub_group_broadcast(q[1].s7, 7), acc[1]); acc[2] = fma(kv.s7, sub_group_broadcast(q[2].s7, 7), acc[2]); acc[3] = fma(kv.s7, sub_group_broadcast(q[3].s7, 7), acc[3]); acc[4] = fma(kv.s7, sub_group_broadcast(q[4].s7, 7), acc[4]); acc[5] = fma(kv.s7, sub_group_broadcast(q[5].s7, 7), acc[5]); acc[6] = fma(kv.s7, sub_group_broadcast(q[6].s7, 7), acc[6]); acc[7] = fma(kv.s7, sub_group_broadcast(q[7].s7, 7), acc[7]);
++        }
++        const float mv = (live && mask) ? vload_half(r, mask) : 0.0f;
++        for (int h = 0; h < H; h++) P[h][rl] = live ? acc[h] * scale + mv : -INFINITY;
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    // 2) softmax statistics: subgroup sg handles head sg
++    {
++        const int h = sg;
++        float m = -INFINITY;
++        for (int i = lane; i < ch; i += 8) m = fmax(m, P[h][i]);
++        m = sub_group_reduce_max(m);
++        float s = 0.0f;
++        for (int i = lane; i < ch; i += 8) { const float e = m == -INFINITY ? 0.0f : exp(P[h][i] - m); P[h][i] = e; s += e; }
++        s = sub_group_reduce_add(s);
++        if (lane == 0) { Ml[h] = m; Sl[h] = s; }
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    // 3) V: lane owns 8 output dims; weights for 8 rows loaded at once, handed out by broadcast
++    const int nr = min(ch, n_kv - r0);
++    float8 o[H];
++    for (int h = 0; h < H; h++) o[h] = (float8) 0.0f;
++    for (int rr = 0; rr < nr; rr += 8) {
++        float p[H];
++        for (int h = 0; h < H; h++) p[h] = (rr + lane < nr) ? P[h][rr + lane] : 0.0f;
++        const int nj = min(8, nr - rr);
++        __global const half * vb = V + (size_t) (r0 + rr) * v_stride + lid * 8;
++        if (0 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 0 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 0), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 0), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 0), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 0), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 0), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 0), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 0), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 0), vv, o[7]); }
++        if (1 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 1 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 1), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 1), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 1), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 1), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 1), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 1), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 1), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 1), vv, o[7]); }
++        if (2 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 2 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 2), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 2), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 2), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 2), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 2), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 2), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 2), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 2), vv, o[7]); }
++        if (3 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 3 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 3), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 3), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 3), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 3), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 3), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 3), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 3), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 3), vv, o[7]); }
++        if (4 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 4 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 4), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 4), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 4), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 4), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 4), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 4), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 4), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 4), vv, o[7]); }
++        if (5 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 5 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 5), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 5), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 5), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 5), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 5), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 5), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 5), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 5), vv, o[7]); }
++        if (6 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 6 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 6), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 6), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 6), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 6), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 6), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 6), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 6), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 6), vv, o[7]); }
++        if (7 < nj) { const float8 vv = convert_float8(as_half8(vload4(0, (__global const uint *) (vb + 7 * v_stride)))); o[0] = fma((float8) sub_group_broadcast(p[0], 7), vv, o[0]); o[1] = fma((float8) sub_group_broadcast(p[1], 7), vv, o[1]); o[2] = fma((float8) sub_group_broadcast(p[2], 7), vv, o[2]); o[3] = fma((float8) sub_group_broadcast(p[3], 7), vv, o[3]); o[4] = fma((float8) sub_group_broadcast(p[4], 7), vv, o[4]); o[5] = fma((float8) sub_group_broadcast(p[5], 7), vv, o[5]); o[6] = fma((float8) sub_group_broadcast(p[6], 7), vv, o[6]); o[7] = fma((float8) sub_group_broadcast(p[7], 7), vv, o[7]); }
++    }
++    __global float * pc = part + (size_t) c * H * (2 + DV);
++    for (int h = 0; h < H; h++) {
++        if (lid == 0) { pc[h * (2 + DV)] = Ml[h]; pc[h * (2 + DV) + 1] = Sl[h]; }
++        vstore8(o[h], 0, pc + h * (2 + DV) + 2 + lid * 8);
++    }
++}
++
++// combine the per-chunk partials into one (M, S, sum p*V) per head; work-group = one head, lane = 8 dims
++__attribute__((reqd_work_group_size(WG, 1, 1)))
++__kernel void attn_merge(__global const float * part, int n_chunks, __global float * out) {
++    const int h = get_group_id(0), lid = get_local_id(0);
++    float M = -INFINITY, S = 0.0f;
++    float8 acc = (float8) 0.0f;
++    for (int c = 0; c < n_chunks; c++) {
++        __global const float * pc = part + ((size_t) c * H + h) * (2 + DV);
++        const float Mc = pc[0], Sc = pc[1];
++        if (Sc == 0.0f) continue;
++        const float Mn = fmax(M, Mc), a = (M == -INFINITY) ? 0.0f : exp(M - Mn), b = exp(Mc - Mn);
++        acc = acc * a + vload8(0, pc + 2 + lid * 8) * b;
++        S = S * a + Sc * b;
++        M = Mn;
++    }
++    __global float * o = out + (size_t) h * (2 + DV);
++    if (lid == 0) { o[0] = M; o[1] = S; }
++    vstore8(acc, 0, o + 2 + lid * 8);
++}
++)CLC";
++
++struct attn_prog { int h, dk, dv; cl_kernel k_chunk, k_merge; };
++
++struct attn_state {
++    bool             ok = false;
++    float            frac = 0.0f;
++    int64_t          min_rows = 1536;
++    cl_device_id     dev = nullptr;
++    cl_context       ctx = nullptr;
++    cl_command_queue q = nullptr;
++    std::vector<attn_prog> progs;
++    std::vector<window>    wins;
++    float *          part = nullptr;   // per-chunk partials (host memory, zero copy)
++    float *          fin  = nullptr;   // merged per-head partials
++    cl_mem           m_part = nullptr, m_fin = nullptr;
++    size_t           part_cap = 0;
++    std::mutex       mu;
++};
++
++attn_state & A() {
++    static attn_state s;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        const char * e = getenv("GGML_IGPU_ATTN");
++        if (!e || atof(e) <= 0) return;
++        s.frac = (float) atof(e);
++        if (const char * m = getenv("GGML_IGPU_ATTN_MIN")) s.min_rows = atoll(m);
++        cl_platform_id p; cl_int err;
++        if (clGetPlatformIDs(1, &p, nullptr) != CL_SUCCESS || clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 1, &s.dev, nullptr) != CL_SUCCESS) {
++            fprintf(stderr, "ggml-igpu-attn: no OpenCL GPU, disabled\n"); return;
++        }
++        s.ctx = clCreateContext(nullptr, 1, &s.dev, nullptr, nullptr, &err);
++        s.q   = clCreateCommandQueueWithProperties(s.ctx, s.dev, nullptr, &err);
++        s.part_cap = (size_t) 8 << 20;                                  // 8 MB of chunk partials, 64 KB merged
++        s.part = (float *) aligned_alloc(4096, s.part_cap);
++        s.fin  = (float *) aligned_alloc(4096, 65536);
++        s.m_part = clCreateBuffer(s.ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, s.part_cap, s.part, &err);
++        s.m_fin  = clCreateBuffer(s.ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, 65536, s.fin, &err);
++        s.ok = err == CL_SUCCESS;
++        char name[256] = {0}; clGetDeviceInfo(s.dev, CL_DEVICE_NAME, sizeof(name), name, nullptr);
++        fprintf(stderr, "ggml-igpu-attn: %s takes %.0f%% of cached rows (from %lld rows)\n", name, s.frac * 100, (long long) s.min_rows);
++    });
++    return s;
++}
++
++attn_prog * attn_prog_for(int h, int dk, int dv) {
++    auto & s = A();
++    for (auto & p : s.progs) if (p.h == h && p.dk == dk && p.dv == dv) return p.k_chunk ? &p : nullptr;
++    char opts[256];
++    snprintf(opts, sizeof(opts), "-cl-std=CL1.2 -cl-mad-enable -cl-fast-relaxed-math -DH=%d -DDK=%d -DDV=%d", h, dk, dv);
++    cl_int err;
++    cl_program pr = clCreateProgramWithSource(s.ctx, 1, &a_src, nullptr, &err);
++    attn_prog ap = { h, dk, dv, nullptr, nullptr };
++    if (clBuildProgram(pr, 1, &s.dev, opts, nullptr, nullptr) != CL_SUCCESS) {
++        static char log[16384]; clGetProgramBuildInfo(pr, s.dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
++        fprintf(stderr, "ggml-igpu-attn: kernel build failed (%s):\n%s\n", opts, log);
++    } else {
++        ap.k_chunk = clCreateKernel(pr, "attn_chunk", &err);
++        ap.k_merge = clCreateKernel(pr, "attn_merge", &err);
++    }
++    s.progs.push_back(ap);
++    return ap.k_chunk ? &s.progs.back() : nullptr;
++}
++
++cl_mem attn_window(const ggml_tensor * t, const void * pv, size_t n, size_t * off) {
++    auto & s = A();
++    const char * p = (const char *) pv;
++    for (auto & w : s.wins) {
++        if (p >= w.base && p + n <= w.base + w.size) { *off = p - w.base; return w.mem; }
++    }
++    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
++    if (!buf) return nullptr;
++    const char * start = (const char *) ggml_backend_buffer_get_base(buf);
++    const size_t size  = ggml_backend_buffer_get_size(buf) / 64 * 64;
++    if (((uintptr_t) start & 4095) != 0 || p < start || p + n > start + size) return nullptr;
++    cl_int err;
++    cl_mem m = clCreateBuffer(s.ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL, size, (void *) start, &err);
++    if (err != CL_SUCCESS) { fprintf(stderr, "ggml-igpu-attn: zero-copy window of %zu MB failed (%d)\n", size >> 20, err); return nullptr; }
++    s.wins.push_back({start, size, m});
++    *off = p - start;
++    return m;
++}
++
++} // namespace
++
++extern "C" int64_t ggml_igpu_attn_rows(const ggml_tensor * dst) {
++    auto & s = A();
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2];
++    if (!s.ok || k->ne[2] != 1 || q->ne[2] != 8 || v->ne[0] != 512 || k->ne[0] % 64 != 0 || k->ne[1] < s.min_rows) return 0;
++    return (int64_t) (k->ne[1] * s.frac) / 64 * 64;
++}
++
++extern "C" void * ggml_igpu_attn_launch(const ggml_tensor * dst, int64_t rows) {
++    auto & s = A();
++    std::lock_guard<std::mutex> lock(s.mu);
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
++    attn_prog * ap = attn_prog_for((int) q->ne[2], (int) k->ne[0], (int) v->ne[0]);
++    if (!ap) return nullptr;
++    const int H = (int) q->ne[2], DV = (int) v->ne[0];
++    int ch = 64;
++    while (ch < 256 && (rows + ch - 1) / ch > 72) ch *= 2;
++    const int n_chunks = (int) ((rows + ch - 1) / ch);
++    if ((size_t) n_chunks * H * (2 + DV) * sizeof(float) > s.part_cap) return nullptr;
++    size_t koff, voff, qoff, moff = 0;
++    cl_mem K = attn_window(k, k->data, (size_t) rows * k->nb[1], &koff);
++    cl_mem V = attn_window(v, v->data, (size_t) rows * v->nb[1], &voff);
++    cl_mem Q = attn_window(q, q->data, (size_t) H * q->nb[2], &qoff);
++    cl_mem M = mask ? attn_window(mask, mask->data, (size_t) rows * sizeof(ggml_fp16_t), &moff) : nullptr;
++    if (!K || !V || !Q || (mask && !M)) return nullptr;
++    if (koff % 2 || voff % 2 || qoff % 4 || moff % 2) return nullptr;
++    float scale;
++    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
++    const cl_ulong ko = koff / 2, vo = voff / 2, qo = qoff / 4, mo = moff / 2;
++    const cl_ulong ks = k->nb[1] / 2, vs = v->nb[1] / 2, qs = q->nb[2] / 4;
++    const int n_kv = (int) rows, has_mask = M != nullptr;
++    cl_mem Mb = M ? M : K;                       // any valid buffer when there is no mask
++    cl_kernel kc = ap->k_chunk;
++    clSetKernelArg(kc, 0, sizeof(cl_mem), &K);  clSetKernelArg(kc, 1, sizeof(cl_ulong), &ko); clSetKernelArg(kc, 2, sizeof(cl_ulong), &ks);
++    clSetKernelArg(kc, 3, sizeof(cl_mem), &V);  clSetKernelArg(kc, 4, sizeof(cl_ulong), &vo); clSetKernelArg(kc, 5, sizeof(cl_ulong), &vs);
++    clSetKernelArg(kc, 6, sizeof(cl_mem), &Q);  clSetKernelArg(kc, 7, sizeof(cl_ulong), &qo); clSetKernelArg(kc, 8, sizeof(cl_ulong), &qs);
++    clSetKernelArg(kc, 9, sizeof(cl_mem), &Mb); clSetKernelArg(kc, 10, sizeof(cl_ulong), &mo); clSetKernelArg(kc, 11, sizeof(int), &has_mask);
++    clSetKernelArg(kc, 12, sizeof(float), &scale); clSetKernelArg(kc, 13, sizeof(int), &n_kv);
++    clSetKernelArg(kc, 14, sizeof(cl_mem), &s.m_part); clSetKernelArg(kc, 15, sizeof(int), &ch);
++    const size_t lws = DV / 8, gws = (size_t) n_chunks * lws;
++    cl_kernel km = ap->k_merge;
++    clSetKernelArg(km, 0, sizeof(cl_mem), &s.m_part); clSetKernelArg(km, 1, sizeof(int), &n_chunks); clSetKernelArg(km, 2, sizeof(cl_mem), &s.m_fin);
++    const size_t gws2 = (size_t) H * lws;
++    cl_event ev = nullptr;
++    if (clEnqueueNDRangeKernel(s.q, kc, 1, nullptr, &gws, &lws, 0, nullptr, nullptr) != CL_SUCCESS ||
++        clEnqueueNDRangeKernel(s.q, km, 1, nullptr, &gws2, &lws, 0, nullptr, &ev) != CL_SUCCESS) {
++        ev = nullptr;
++    }
++    clFlush(s.q);
++    return ev;
++}
++
++extern "C" bool ggml_igpu_attn_wait(void * handle, float * out, int64_t n_heads, int64_t dv, int64_t out_stride) {
++    if (!handle) return false;
++    cl_event ev = (cl_event) handle;
++    // poll instead of sleeping in the driver: the result is due in well under a millisecond
++    cl_int st = CL_QUEUED;
++    for (;;) {
++        if (clGetEventInfo(ev, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(st), &st, nullptr) != CL_SUCCESS || st <= CL_COMPLETE) break;
++    }
++    if (st < 0) clWaitForEvents(1, &ev);
++    clReleaseEvent(ev);
++    auto & s = A();
++    for (int64_t h = 0; h < n_heads; h++) memcpy(out + h * out_stride, s.fin + h * (2 + dv), (2 + dv) * sizeof(float));
++    return true;
++}
+diff --git a/ggml/src/ggml-cpu/igpu.h b/ggml/src/ggml-cpu/igpu.h
+new file mode 100644
+index 0000000..d535a74
+--- /dev/null
++++ b/ggml/src/ggml-cpu/igpu.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++// Integrated-GPU co-worker for CPU matmuls (Intel iGPU via OpenCL, zero copy on host memory).
++// For single-token GEMV on repacked Q4_0 (block_q4_0x8) weights, the iGPU computes the first rows of the output
++// while the CPU threads compute the rest: both read the same RAM, and on small CPUs the CPU kernels alone
++// leave some memory bandwidth unused. Enabled with GGML_IGPU=<fraction of rows>, e.g. GGML_IGPU=0.25.
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct ggml_tensor;
++
++// rows (multiple of 64) the iGPU should take for this matmul, 0 = none. Pure function of shapes + env, so every
++// thread computes the same value.
++int64_t ggml_igpu_q4x8_rows(const struct ggml_tensor * src0, const struct ggml_tensor * src1);
++
++// start the iGPU on rows [0, rows); returns an opaque handle, or NULL on failure (caller computes those rows itself)
++void * ggml_igpu_q4x8_launch(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, int64_t rows);
++
++// wait for a launch to finish
++void ggml_igpu_wait(void * handle);
++
++// iGPU attention co-worker (GGML_IGPU_ATTN=<fraction>): cached rows [0, rows) go to the iGPU, 0 = none.
++// Pure function of shapes + env, so every thread computes the same value.
++int64_t ggml_igpu_attn_rows(const struct ggml_tensor * dst);
++void *  ggml_igpu_attn_launch(const struct ggml_tensor * dst, int64_t rows);
++// wait, then write the merged partial (M, S, sum p*V[dv]) of every head to out + h * out_stride; false if no job
++bool    ggml_igpu_attn_wait(void * handle, float * out, int64_t n_heads, int64_t dv, int64_t out_stride);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index ba00a0a..7932bc0 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -7,6 +7,9 @@
+ #include "ggml.h"
+ #include "unary-ops.h"
+ #include "vec.h"
++#ifdef GGML_USE_IGPU
++#include "igpu.h"
++#endif
+ 
+ #include <algorithm>
+ #include <cfloat>
+@@ -743,7 +746,12 @@ static void ggml_compute_forward_add_id_f32(
+         // src1 indices
+         const int i11 = *(int32_t *) ((char *) src2->data + i1*nb20 + i2*nb21);
+ 
+-        GGML_ASSERT(i11 >= 0 && i11 < ne11);
++        if (i11 < 0) {
++            // skipped expert (expert parallelism): no bias, row is multiplied by a zero weight later
++            memcpy((char *) dst->data + i3*nb3 + i2*nb2 + i1*nb1, (char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01, ne0*sizeof(float));
++            continue;
++        }
++        GGML_ASSERT(i11 < ne11);
+ 
+         ggml_vec_add_f32(ne0,
+                 (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1 ),
+@@ -9143,7 +9151,9 @@ static void ggml_flash_attn_ext_reduce_partials(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+         const int64_t n_chunks,
+-        const int64_t chunk_size) {
++        const int64_t chunk_size,
++        const int64_t row0 = 0,
++        const float * extra = nullptr) {
+ 
+     const ggml_tensor * q = dst->src[0];
+     const ggml_tensor * k = dst->src[1];
+@@ -9178,7 +9188,7 @@ static void ggml_flash_attn_ext_reduce_partials(
+ 
+         // Combine partials from all chunks
+         for (int64_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+-            const int64_t ic_start = chunk_idx * chunk_size;
++            const int64_t ic_start = row0 + chunk_idx * chunk_size;
+             if (ic_start >= nek1) continue;
+ 
+             const float * partial   = partials_base + (q_head * n_chunks + chunk_idx) * partial_size;
+@@ -9198,6 +9208,14 @@ static void ggml_flash_attn_ext_reduce_partials(
+             S_final = S_final * scale_old + S_chunk * scale_new;
+             M_final = M_new;
+         }
++        if (extra && extra[q_head * (2 + DV) + 1] != 0.0f) {       // the iGPU's rows [0, row0)
++            const float * partial = extra + q_head * (2 + DV);
++            const float M_new = fmaxf(M_final, partial[0]);
++            const float scale_old = expf(M_final - M_new), scale_new = expf(partial[0] - M_new);
++            for (int64_t d = 0; d < DV; ++d) VKQ_final[d] = VKQ_final[d] * scale_old + partial[2 + d] * scale_new;
++            S_final = S_final * scale_old + partial[1] * scale_new;
++            M_final = M_new;
++        }
+ 
+         // Normalize and write to output
+         if (S_final != 0.0f) {
+@@ -9209,6 +9227,189 @@ static void ggml_flash_attn_ext_reduce_partials(
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------
++// Decode fast path for multi-query attention (one query token, many heads sharing ONE f16 K/V head -- e.g. DeepSeek
++// MLA, where V is even a view of the first DV values of each K row). The generic path runs every head separately:
++// it re-reads and re-converts each cached row once per head and keeps its V accumulator in f16 (converted back and
++// forth for every row). Here each block of rows is converted to f32 once, all heads are scored together (one
++// register accumulator per head), and V is accumulated for all heads from the same converted rows, in f32.
++// Writes the same per-thread partials (M, S, VKQ) as the split-KV path. GGML_FA_MQA=0 disables it,
++// GGML_FA_MQA_CHECK=1 compares it with the generic path on the first calls.
++#if defined(__AVX2__) && defined(__FMA__)
++#include <immintrin.h>
++#endif
++
++static bool ggml_fa_mqa_decode_ok(const ggml_tensor * dst) {
++    static const bool on = [] { const char * e = getenv("GGML_FA_MQA"); return !(e && e[0] == '0'); }();
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
++    float max_bias;
++    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
++    if (!(on && q->ne[1] == 1 && q->ne[3] == 1 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
++          v->type == GGML_TYPE_F16 && k->ne[3] == 1 && v->ne[3] == 1 && k->ne[2] == v->ne[2] && k->ne[2] >= 1 &&
++          q->ne[2] % k->ne[2] == 0 && k->ne[0] % 8 == 0 && v->ne[0] % 8 == 0 && k->ne[0] <= 1024 && v->ne[0] <= 1024 &&
++          max_bias == 0.0f && (!mask || mask->ne[2] == 1))) {
++        return false;
++    }
++    const int64_t G = q->ne[2] / k->ne[2];               // query heads per kv head
++    return G >= 2 && G <= 16;
++}
++
++static void ggml_fa_mqa_decode_group(const ggml_tensor * dst, int64_t kvh, int64_t ic0, int64_t ic1, float * partials, int64_t partial_stride);
++
++static void ggml_fa_mqa_decode_chunk(const ggml_tensor * dst, int64_t ic0, int64_t ic1, float * partials, int64_t partial_stride) {
++    for (int64_t g = 0; g < dst->src[1]->ne[2]; g++) {
++        ggml_fa_mqa_decode_group(dst, g, ic0, ic1, partials, partial_stride);
++    }
++}
++
++// one kv head and the G query heads that share it
++static void ggml_fa_mqa_decode_group(const ggml_tensor * dst, int64_t kvh, int64_t ic0, int64_t ic1, float * partials, int64_t partial_stride) {
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3], * sinks = dst->src[4];
++    const int H = (int) (q->ne[2] / k->ne[2]), DK = (int) k->ne[0], DV = (int) v->ne[0];
++    const int64_t h0 = kvh * H;                          // first query head of this group
++    constexpr int R = 16;
++    float scale, softcap;
++    memcpy(&scale,   (float *) dst->op_params + 0, sizeof(float));
++    memcpy(&softcap, (float *) dst->op_params + 2, sizeof(float));
++    if (softcap != 0.0f) scale /= softcap;
++
++    // V shares K's rows (MLA): reuse the converted K block
++    const bool v_in_k = v->data == k->data && v->nb[1] == k->nb[1] && v->nb[2] == k->nb[2];
++    const char * kbase = (const char *) k->data + kvh * k->nb[2];
++    const char * vbase = (const char *) v->data + kvh * v->nb[2];
++    thread_local std::vector<float> buf;
++    const size_t need = (size_t) H * DK + (size_t) R * DK + (v_in_k ? 0 : (size_t) R * DV) + (size_t) H * DV + (size_t) H * R;
++    if (buf.size() < need) buf.resize(need);
++    float * Qf  = buf.data();                       // [H][DK]
++    float * Kf  = Qf + (size_t) H * DK;             // [R][DK]
++    float * Vf  = v_in_k ? Kf : Kf + (size_t) R * DK;
++    const int vstride = v_in_k ? DK : DV;
++    float * VKQ = Vf + (v_in_k ? (size_t) R * DK : (size_t) R * DV);   // [H][DV]
++    float * P   = VKQ + (size_t) H * DV;            // [H][R] scores, then probabilities
++    float M[16], S[16];
++
++    for (int h = 0; h < H; h++) {
++        memcpy(Qf + (size_t) h * DK, (const char *) q->data + (h0 + h) * q->nb[2], DK * sizeof(float));
++        M[h] = -INFINITY;
++        S[h] = 0.0f;
++    }
++    memset(VKQ, 0, (size_t) H * DV * sizeof(float));
++    const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) mask->data : nullptr;
++
++    for (int64_t ic = ic0; ic < ic1; ic += R) {
++        const int nr = (int) std::min<int64_t>(R, ic1 - ic);
++        float mv[R];
++        int live = 0;
++        for (int r = 0; r < nr; r++) {
++            mv[r] = mp ? GGML_CPU_FP16_TO_FP32(mp[ic + r]) : 0.0f;
++            live += mv[r] != -INFINITY;
++        }
++        if (!live) continue;
++        for (int r = 0; r < nr; r++) {
++            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) (kbase + (ic + r) * k->nb[1]), Kf + (size_t) r * DK, DK);
++            if (!v_in_k) {
++                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) (vbase + (ic + r) * v->nb[1]), Vf + (size_t) r * DV, DV);
++            }
++        }
++        // scores for all heads: one pass over each K row
++        for (int r = 0; r < nr; r++) {
++            const float * kr = Kf + (size_t) r * DK;
++#if defined(__AVX2__) && defined(__FMA__)
++            if (H == 8) {
++                __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
++                for (int d = 0; d < DK; d += 8) {
++                    const __m256 kv = _mm256_loadu_ps(kr + d);
++                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 0 * DK + d), kv, a0);
++                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 1 * DK + d), kv, a1);
++                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 2 * DK + d), kv, a2);
++                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 3 * DK + d), kv, a3);
++                    a4 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 4 * DK + d), kv, a4);
++                    a5 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 5 * DK + d), kv, a5);
++                    a6 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 6 * DK + d), kv, a6);
++                    a7 = _mm256_fmadd_ps(_mm256_loadu_ps(Qf + 7 * DK + d), kv, a7);
++                }
++                const __m256 acc[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
++                for (int h = 0; h < 8; h++) {
++                    __m128 x = _mm_add_ps(_mm256_castps256_ps128(acc[h]), _mm256_extractf128_ps(acc[h], 1));
++                    x = _mm_add_ps(x, _mm_movehl_ps(x, x));
++                    x = _mm_add_ss(x, _mm_movehdup_ps(x));
++                    P[h * R + r] = _mm_cvtss_f32(x);
++                }
++                continue;
++            }
++#endif
++            for (int h = 0; h < H; h++) {
++                float sum = 0.0f;
++                ggml_vec_dot_f32(DK, &sum, 0, Qf + (size_t) h * DK, 0, kr, 0, 1);
++                P[h * R + r] = sum;
++            }
++        }
++        // online softmax, one block at a time
++        for (int h = 0; h < H; h++) {
++            float * ph = P + h * R;
++            float bmax = -INFINITY;
++            for (int r = 0; r < nr; r++) {
++                float s = ph[r] * scale;
++                if (softcap != 0.0f) s = softcap * tanhf(s);
++                s += mv[r];
++                ph[r] = s;
++                bmax = std::max(bmax, s);
++            }
++            const float Mn = std::max(M[h], bmax);
++            const float ms = M[h] == -INFINITY ? 0.0f : expf(M[h] - Mn);
++            float sum = 0.0f;
++            for (int r = 0; r < nr; r++) {
++                ph[r] = ph[r] == -INFINITY ? 0.0f : expf(ph[r] - Mn);
++                sum += ph[r];
++            }
++            if (ms != 1.0f) {
++                ggml_vec_scale_f32(DV, VKQ + (size_t) h * DV, ms);
++            }
++            S[h] = S[h] * ms + sum;
++            M[h] = Mn;
++        }
++        // V: accumulate all heads from the same converted rows, 8 dims at a time, head accumulators in registers
++#if defined(__AVX2__) && defined(__FMA__)
++        if (H == 8) {
++            for (int d = 0; d < DV; d += 8) {
++                __m256 a[8];
++                for (int h = 0; h < 8; h++) a[h] = _mm256_loadu_ps(VKQ + (size_t) h * DV + d);
++                for (int r = 0; r < nr; r++) {
++                    const __m256 vv = _mm256_loadu_ps(Vf + (size_t) r * vstride + d);
++                    for (int h = 0; h < 8; h++) a[h] = _mm256_fmadd_ps(_mm256_broadcast_ss(P + h * R + r), vv, a[h]);
++                }
++                for (int h = 0; h < 8; h++) _mm256_storeu_ps(VKQ + (size_t) h * DV + d, a[h]);
++            }
++            continue;
++        }
++#endif
++        for (int h = 0; h < H; h++) {
++            for (int r = 0; r < nr; r++) {
++                if (P[h * R + r] != 0.0f) ggml_vec_mad_f32(DV, VKQ + (size_t) h * DV, Vf + (size_t) r * vstride, P[h * R + r]);
++            }
++        }
++    }
++    if (sinks && ic0 == 0) {                             // attention sinks (gpt-oss): once, on the first kv chunk
++        for (int h = 0; h < H; h++) {
++            const float sk = ((const float *) sinks->data)[h0 + h];
++            if (sk > M[h]) {
++                const float ms = M[h] == -INFINITY ? 0.0f : expf(M[h] - sk);
++                ggml_vec_scale_f32(DV, VKQ + (size_t) h * DV, ms);
++                S[h] = S[h] * ms + 1.0f;
++                M[h] = sk;
++            } else {
++                S[h] += expf(sk - M[h]);
++            }
++        }
++    }
++    for (int h = 0; h < H; h++) {
++        float * part = partials + (size_t) (h0 + h) * partial_stride;
++        part[0] = M[h];
++        part[1] = S[h];
++        memcpy(part + 2, VKQ + (size_t) h * DV, DV * sizeof(float));
++    }
++}
++
+ static void ggml_compute_forward_flash_attn_ext_f16(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -9261,23 +9462,82 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+ 
+     if (use_split_kv_path) {
+-        const int64_t chunk_size = (nek1 + nth - 1) / nth;
++        // iGPU co-worker (GGML_IGPU_ATTN): it takes cached rows [0, g_rows), the CPU threads split the rest
++        int64_t g_rows = 0;
++        void *  gpu_job = nullptr;
++        static float gpu_part[16 * (2 + 1024)];
++#ifdef GGML_USE_IGPU
++        if (ggml_fa_mqa_decode_ok(dst) && neq2 <= 16 && DV <= 1024) g_rows = ggml_igpu_attn_rows(dst);
++        if (g_rows && ith == 0) gpu_job = ggml_igpu_attn_launch(dst, g_rows);
++#endif
++        const int64_t chunk_size = (nek1 - g_rows + nth - 1) / nth;
+ 
+         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
+         const int64_t partial_size  = 2 + DV;
+         float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+ 
+-        const int64_t ic_start = ith * chunk_size;
++        const int64_t ic_start = g_rows + ith * chunk_size;
+         const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
+ 
+         const int64_t partial_stride = nth * partial_size;
+         float *       chunk_partials = partials_base + ith * partial_size;
+ 
+         if (ic_start < nek1) {
+-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
+-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
+-                    chunk_partials, partial_stride);
++            if (ggml_fa_mqa_decode_ok(dst)) {
++                ggml_fa_mqa_decode_chunk(dst, ic_start, ic_end, chunk_partials, partial_stride);
++                static int check_left = [] { const char * e = getenv("GGML_FA_MQA_CHECK"); return (e && e[0] == '1') ? 60 : 0; }();
++                if (check_left > 0 && ith == 0) {       // compare with the generic path (unnormalized partials -> VKQ/S)
++                    check_left--;
++                    std::vector<float> ref((size_t) neq2 * partial_stride);
++                    for (int64_t q_head = 0; q_head < neq2; q_head++) {
++                        ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, q_head, q_head + 1, ic_start, ic_end, ref.data(), partial_stride);
++                    }
++                    // exact reference in double precision straight from the f16 cache
++                    const ggml_tensor * qq = dst->src[0], * kk = dst->src[1], * vv = dst->src[2], * mk = dst->src[3];
++                    float sc;
++                    memcpy(&sc, (float *) dst->op_params + 0, sizeof(float));
++                    double err_fast = 0, err_gen = 0, mag = 1e-9;
++                    std::vector<double> w((size_t) (ic_end - ic_start)), o((size_t) DV);
++                    for (int64_t h = 0; h < neq2; h++) {
++                        const float * qh = (const float *) ((const char *) qq->data + h * qq->nb[2]);
++                        const int64_t gk = h / (neq2 / kk->ne[2]);
++                        double m = -INFINITY;
++                        for (int64_t c = ic_start; c < ic_end; c++) {
++                            const ggml_fp16_t * kr = (const ggml_fp16_t *) ((const char *) kk->data + c * kk->nb[1] + gk * kk->nb[2]);
++                            double dot = 0;
++                            for (int64_t d = 0; d < DK; d++) dot += (double) qh[d] * GGML_CPU_FP16_TO_FP32(kr[d]);
++                            const double mvv = mk ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mk->data)[c]) : 0.0;
++                            w[c - ic_start] = dot * sc + mvv;
++                            m = std::max(m, w[c - ic_start]);
++                        }
++                        const ggml_tensor * snk = dst->src[4];
++                        const double sink = (snk && ic_start == 0) ? ((const float *) snk->data)[h] : -INFINITY;
++                        m = std::max(m, sink);
++                        double sum = std::isinf(sink) ? 0.0 : std::exp(sink - m);
++                        std::fill(o.begin(), o.end(), 0.0);
++                        for (int64_t c = ic_start; c < ic_end; c++) {
++                            const double e = std::isinf(w[c - ic_start]) ? 0.0 : std::exp(w[c - ic_start] - m);
++                            sum += e;
++                            const ggml_fp16_t * vr = (const ggml_fp16_t *) ((const char *) vv->data + c * vv->nb[1] + gk * vv->nb[2]);
++                            for (int64_t d = 0; d < DV; d++) o[d] += e * GGML_CPU_FP16_TO_FP32(vr[d]);
++                        }
++                        const float * a = chunk_partials + h * partial_stride, * b = ref.data() + h * partial_stride;
++                        for (int64_t d = 0; d < DV; d++) {
++                            const double ex = sum > 0 ? o[d] / sum : 0;
++                            err_fast = std::max(err_fast, std::fabs((a[1] > 0 ? a[2 + d] / a[1] : 0) - ex));
++                            err_gen  = std::max(err_gen,  std::fabs((b[1] > 0 ? b[2 + d] / b[1] : 0) - ex));
++                            mag = std::max(mag, std::fabs(ex));
++                        }
++                    }
++                    fprintf(stderr, "fa_mqa check: kv %lld heads %lld: max error vs exact: new %.3g, generic %.3g (largest value %.3g)\n",
++                            (long long) (ic_end - ic_start), (long long) neq2, err_fast, err_gen, mag);
++                }
++            } else {
++                for (int64_t q_head = 0; q_head < neq2; q_head++) {
++                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(
++                        params, dst, q_head, q_head + 1, ic_start, ic_end,
++                        chunk_partials, partial_stride);
++                }
+             }
+         } else {
+             for (int64_t q_head = 0; q_head < neq2; q_head++) {
+@@ -9288,7 +9548,32 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         }
+ 
+         ggml_barrier(params->threadpool);
+-        ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
++        if (g_rows) {
++#ifdef GGML_USE_IGPU
++            if (ith == 0 && !ggml_igpu_attn_wait(gpu_job, gpu_part, neq2, DV, 2 + DV)) {
++                ggml_fa_mqa_decode_chunk(dst, 0, g_rows, gpu_part, 2 + DV);      // launch failed: do the rows here
++            } else if (ith == 0) {
++                // GGML_IGPU_ATTN_CHECK=1: recompute the iGPU's rows on the CPU and compare (first 60 calls)
++                static int left = [] { const char * e = getenv("GGML_IGPU_ATTN_CHECK"); return (e && e[0] == '1') ? 60 : 0; }();
++                if (left > 0) {
++                    left--;
++                    std::vector<float> ref((size_t) neq2 * (2 + DV));
++                    ggml_fa_mqa_decode_chunk(dst, 0, g_rows, ref.data(), 2 + DV);
++                    double worst = 0, mag = 1e-9;
++                    for (int64_t h = 0; h < neq2; h++) {
++                        const float * g = gpu_part + h * (2 + DV), * c = ref.data() + h * (2 + DV);
++                        for (int64_t d = 0; d < DV; d++) {
++                            const double x = g[1] > 0 ? g[2 + d] / g[1] : 0, y = c[1] > 0 ? c[2 + d] / c[1] : 0;
++                            worst = std::max(worst, std::fabs(x - y)); mag = std::max(mag, std::fabs(y));
++                        }
++                    }
++                    fprintf(stderr, "igpu attn check: %lld rows on the GPU, max |gpu-cpu| = %.3g (largest value %.3g)\n", (long long) g_rows, worst, mag);
++                }
++            }
++#endif
++            ggml_barrier(params->threadpool);
++        }
++        ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size, g_rows, g_rows ? gpu_part : nullptr);
+     } else {
+ 
+         // total rows in q
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index d56db98..6ba5cd5 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -17,6 +17,9 @@
+ #include <cstdio>  // for GGML_ASSERT
+ 
+ #include "repack.h"
++#ifdef GGML_USE_IGPU
++#include "igpu.h"
++#endif
+ 
+ #if defined(__GNUC__)
+ #pragma GCC diagnostic ignored "-Woverlength-strings"
+@@ -840,6 +843,63 @@ void ggml_gemv_q4_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+     }
+ }
+ 
++// weight k (0..31) of interleaved row r (0..7) of a block_q5_0x8, as a signed value (-16..15)
++static inline int q5_0x8_weight(const block_q5_0x8 & b, int r, int k) {
++    const int half = k >> 4, kk = k & 15;
++    const int j  = ((kk >> 3) << 1) | (r >> 2);      // which 32-byte slice of qs
++    const int bb = (r & 3) * 8 + (kk & 7);            // byte inside it
++    const int v  = half * 4 + j;                       // vector index in the AVX2 kernel
++    const int lo = (b.qs[32 * j + bb] >> (4 * half)) & 0xF;
++    const int hi = (b.qh[bb] >> v) & 1;
++    return (lo | (hi << 4)) - 16;
++}
++
++void ggml_gemv_q5_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
++    const int nb = n / QK8_0;
++    UNUSED(bs);
++    UNUSED(nr);
++    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
++    for (int x = 0; x < nc / 8; x++) {
++        const block_q5_0x8 * b_ptr = (const block_q5_0x8 *) vx + (x * nb);
++        for (int r = 0; r < 8; r++) {
++            float sumf = 0.0f;
++            for (int l = 0; l < nb; l++) {
++                int sumi = 0;
++                for (int k = 0; k < QK8_0; k++) {
++                    sumi += q5_0x8_weight(b_ptr[l], r, k) * a_ptr[l].qs[k];
++                }
++                sumf += sumi * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[r]) * GGML_CPU_FP16_TO_FP32(a_ptr[l].d);
++            }
++            s[x * 8 + r] = sumf;
++        }
++    }
++}
++
++// activations: block_q8_0x4 (4 rows, 8-byte interleave); output rows are bs floats apart
++void ggml_gemm_q5_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
++    const int nb = n / QK8_0;
++    for (int y = 0; y < nr / 4; y++) {
++        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
++        for (int x = 0; x < nc / 8; x++) {
++            const block_q5_0x8 * b_ptr = (const block_q5_0x8 *) vx + (x * nb);
++            for (int m = 0; m < 4; m++) {
++                for (int r = 0; r < 8; r++) {
++                    float sumf = 0.0f;
++                    for (int l = 0; l < nb; l++) {
++                        int sumi = 0;
++                        for (int k = 0; k < QK8_0; k++) {
++                            const int kk = k & 15;
++                            sumi += q5_0x8_weight(b_ptr[l], r, k) * a_ptr[l].qs[(k >> 4) * 64 + (kk >> 3) * 32 + m * 8 + (kk & 7)];
++                        }
++                        sumf += sumi * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[r]) * GGML_CPU_FP16_TO_FP32(a_ptr[l].d[m]);
++                    }
++                    s[(y * 4 + m) * bs + x * 8 + r] = sumf;
++                }
++            }
++        }
++    }
++}
++
+ void ggml_gemv_q4_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+     const int qk = QK8_0;
+     const int nb = n / qk;
+@@ -3149,6 +3209,28 @@ static block_q4_0x8 make_block_q4_0x8(block_q4_0 * in, unsigned int blck_size_in
+     return out;
+ }
+ 
++static block_q5_0x8 make_block_q5_0x8(const block_q5_0 * in) {
++    block_q5_0x8 out;
++    for (int i = 0; i < 8; i++) {
++        out.d[i] = in[i].d;
++    }
++    for (int i = 0; i < 16; ++i) {                    // low nibbles: q4_0x8's 8-byte interleave (no xor)
++        memcpy(&out.qs[i * 8], &in[i % 8].qs[(i / 8) * 8], 8);
++    }
++    memset(out.qh, 0, sizeof(out.qh));
++    for (int v = 0; v < 8; v++) {                     // 5th bits, transposed (see block_q5_0x8)
++        const int half = v >> 2, j = v & 3;
++        for (int bb = 0; bb < 32; bb++) {
++            const int r = (j & 1) * 4 + bb / 8;
++            const int k = (j >> 1) * 8 + (bb & 7) + 16 * half;
++            uint32_t qh;
++            memcpy(&qh, in[r].qh, sizeof(qh));
++            out.qh[bb] |= (uint8_t) (((qh >> k) & 1) << v);
++        }
++    }
++    return out;
++}
++
+ static block_q4_0x16 make_block_q4_0x16(block_q4_0 * in, unsigned int blck_size_interleave) {
+     block_q4_0x16 out;
+ 
+@@ -3818,6 +3900,46 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
+     GGML_UNUSED(data_size);
+ }
+ 
++static int repack_q5_0_to_q5_0_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
++    GGML_ASSERT(t->type == GGML_TYPE_Q5_0);
++    block_q5_0x8 * dst = (block_q5_0x8 *) t->data;
++    const block_q5_0 * src = (const block_q5_0 *) data;
++    block_q5_0 tmp[8];
++    const int nrow = ggml_nrows(t);
++    const int nblocks = t->ne[0] / QK5_0;
++    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q5_0));
++    if (t->ne[1] % 8 != 0) {
++        return -1;
++    }
++    static const bool check = [] { const char * e = getenv("GGML_Q5X8_CHECK"); return e && e[0] == '1'; }();
++    int64_t bad = 0;
++    for (int b = 0; b < nrow; b += 8) {
++        for (int64_t x = 0; x < nblocks; x++) {
++            for (int i = 0; i < 8; i++) {
++                tmp[i] = src[x + i * nblocks];
++            }
++            *dst = make_block_q5_0x8(tmp);
++            if (check) {                                          // every weight vs ggml's own q5_0 decoding
++                for (int r = 0; r < 8; r++) {
++                    uint32_t qh;
++                    memcpy(&qh, tmp[r].qh, sizeof(qh));
++                    for (int k = 0; k < 32; k++) {
++                        const int lo = k < 16 ? (tmp[r].qs[k] & 0xF) : (tmp[r].qs[k - 16] >> 4);
++                        const int want = (lo | (((qh >> k) & 1) << 4)) - 16;
++                        bad += q5_0x8_weight(*dst, r, k) != want || dst->d[r] != tmp[r].d;
++                    }
++                }
++            }
++            dst++;
++        }
++        src += 8 * nblocks;
++    }
++    if (check) {
++        fprintf(stderr, "q5_0x8 repack check %s: %lld wrong weights of %lld\n", t->name, (long long) bad, (long long) nrow * nblocks * 32);
++    }
++    return 0;
++}
++
+ static int repack_q8_0_to_q8_0_4_bl(struct ggml_tensor *       t,
+                                     int                        interleave_block,
+                                     const void * GGML_RESTRICT data,
+@@ -4258,6 +4380,10 @@ template <> int repack<block_q4_0, 8, 8>(struct ggml_tensor * t, const void * da
+     return repack_q4_0_to_q4_0_8_bl(t, 8, data, data_size);
+ }
+ 
++template <> int repack<block_q5_0, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
++    return repack_q5_0_to_q5_0_8_bl(t, data, data_size);
++}
++
+ template <> int repack<block_q4_K, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+     return repack_q4_K_to_q4_K_8_bl(t, 8, data, data_size);
+ }
+@@ -4357,6 +4483,14 @@ template <> void gemv<block_q4_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
+     ggml_gemv_q4_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++template <> void gemv<block_q5_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
++#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
++    ggml_gemv_q5_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
++#else
++    ggml_gemv_q5_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
++#endif
++}
++
+ template <> void gemv<block_q4_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+     ggml_gemv_q4_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+ }
+@@ -4446,6 +4580,15 @@ template <> void gemv<block_q2_K, 1, 16, GGML_TYPE_Q8_K>(int n, float * s, size_
+ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
+ void gemm(int, float *, size_t, const void *, const void *, int, int);
+ 
++template <> void gemm<block_q5_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
++#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
++    ggml_gemm_q5_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
++#else
++    ggml_gemm_q5_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
++#endif
++}
++
++
+ template <> void gemm<block_q1_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+     ggml_gemm_q1_0_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
+ }
+@@ -4679,6 +4822,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+         GGML_ASSERT(ggml_n_dims(op->src[0]) == 2);
+         // GGML_ASSERT(ggml_n_dims(op->src[1]) == 2);
+ 
++        // iGPU co-worker (GGML_IGPU=fraction): it computes output rows [0, gpu_rows), the CPU threads the rest
++        int64_t gpu_rows = 0;
++        void *  gpu_job  = nullptr;
++#ifdef GGML_USE_IGPU
++        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 8 && NB_COLS == 8) {
++            gpu_rows = ggml_igpu_q4x8_rows(src0, src1);
++            if (gpu_rows > 0 && ith == 0) {
++                gpu_job = ggml_igpu_q4x8_launch(src0, src1, dst, gpu_rows);
++            }
++        }
++#endif
++
+         char *       wdata = static_cast<char *>(params->wdata);
+         const size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
+         const size_t nbw2  = nbw1 * ne11;
+@@ -4708,8 +4863,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+         // disable for NUMA
+         const bool disable_chunking = ggml_is_numa();
+ 
+-        // 4x chunks per thread
+-        const int64_t nr0 = ggml_nrows(op->src[0]);
++        // 4x chunks per thread (rows below gpu_rows belong to the iGPU)
++        const int64_t row_off = gpu_rows;
++        const int64_t nr0 = ggml_nrows(op->src[0]) - row_off;
+ 
+         int     nth_scaled  = nth * 4;
+         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
+@@ -4755,8 +4911,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+             const int64_t ith0 = current_chunk % nchunk0;
+             const int64_t ith1 = current_chunk / nchunk0;
+ 
+-            int64_t src0_start = dr0 * ith0;
+-            int64_t src0_end   = MIN(src0_start + dr0, nr0);
++            int64_t src0_start = row_off + dr0 * ith0;
++            int64_t src0_end   = MIN(src0_start + dr0, row_off + nr0);
+ 
+             // full-plane range for src1
+             int64_t src1_start = ith1 * ne11;
+@@ -4778,6 +4934,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+ 
+             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+         }
++
++#ifdef GGML_USE_IGPU
++        if (ith == 0 && gpu_rows > 0) {
++            if (gpu_job) {
++                ggml_igpu_wait(gpu_job);
++            } else {
++                forward_mul_mat_one_chunk(params, dst, 0, gpu_rows, 0, ne11);  // launch failed: do the iGPU's rows here
++            }
++        }
++#else
++        GGML_UNUSED(gpu_job);
++#endif
+     }
+ 
+     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
+@@ -4855,7 +5023,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                     const int32_t i02 =
+                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+ 
+-                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
++                    if (i02 < 0) {
++                        // skipped expert (expert parallelism): output row is zero
++                        memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
++                        continue;
++                    }
++                    GGML_ASSERT(i02 < n_as);
+ 
+                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
+                     matrix_row_counts[i02] += 1;
+@@ -4933,6 +5106,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+     static const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 8, GGML_TYPE_Q8_0> q4_0_8x8_q8_0;
+ 
+     // instance for Q4_K
++    static const ggml::cpu::repack::tensor_traits<block_q5_0, 8, 8, GGML_TYPE_Q8_0> q5_0_8x8_q8_0;
+     static const ggml::cpu::repack::tensor_traits<block_q4_K, 4, 8, GGML_TYPE_Q8_K> q4_K_8x4_q8_K;
+     static const ggml::cpu::repack::tensor_traits<block_q4_K, 8, 8, GGML_TYPE_Q8_K> q4_K_8x8_q8_K;
+ 
+@@ -5003,6 +5177,12 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+             }
+             #endif
+         }
++    } else if (cur->type == GGML_TYPE_Q5_0) {
++        // AVX2: Q5_0 had no repacked kernel (plain per-row vec_dot); GGML_REPACK_Q5_0=0 keeps it that way
++        static const bool q5_on = [] { const char * e = getenv("GGML_REPACK_Q5_0"); return !(e && e[0] == '0'); }();
++        if (q5_on && ggml_cpu_has_avx2() && cur->ne[1] % 8 == 0 && cur->ne[0] / QK8_0 <= 512) {
++            return &q5_0_8x8_q8_0;
++        }
+     } else if (cur->type == GGML_TYPE_Q4_K) {
+         if (ggml_cpu_has_avx2()) {
+             if (cur->ne[1] % 8 == 0) {
+diff --git a/ggml/src/ggml-cpu/repack.h b/ggml/src/ggml-cpu/repack.h
+index fc6715c..48abd41 100644
+--- a/ggml/src/ggml-cpu/repack.h
++++ b/ggml/src/ggml-cpu/repack.h
+@@ -45,6 +45,17 @@ using block_q8_0x4 = block<8, 4>;
+ using block_q8_0x8 = block<8, 8>;
+ using block_q8_0x16 = block<8, 16>;
+ 
++// Q5_0, 8 rows interleaved like block_q4_0x8 (qs: the low nibbles in exactly q4_0x8's layout, without its xor), plus
++// the 5th bits "transposed": the lean AVX2 kernel works on 8 vectors of 32 bytes per block (low/high nibbles of
++// qs[0:32], qs[32:64], qs[64:96], qs[96:128]); bit v of qh[b] is the 5th bit of the weight at byte b of vector v,
++// so each vector's bits come back with one shift + and. Same size as 8 block_q5_0.
++struct block_q5_0x8 {
++    ggml_half d[8];
++    uint8_t   qh[32];
++    uint8_t   qs[128];
++};
++static_assert(sizeof(block_q5_0x8) == 8 * sizeof(block_q5_0), "wrong q5_0x8 block size/padding");
++
+ struct block_q4_Kx8 {
+     ggml_half d[8];      // super-block scale for quantized scales
+     ggml_half dmin[8];   // super-block scale for quantized mins
+@@ -151,6 +162,10 @@ void ggml_gemv_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+ void ggml_gemv_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemv_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemm_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemv_q5_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemm_q5_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index cdc10a7..790102d 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -38,6 +38,10 @@
+ #include <syscall.h>
+ #endif
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
+ #if defined(__APPLE__)
+ #include <unistd.h>
+ #include <mach/mach.h>
+@@ -329,6 +333,63 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
+ #endif
+ 
+ 
++#if defined(__linux__)
++// GGML_HUGETLB=1: take large buffers from the kernel's reserved 2 MiB pages (vm.nr_hugepages, set just before the
++// model loads). Unlike transparent huge pages these are guaranteed even when RAM is fragmented, and never swapped.
++// Falls back to THP when the reserve is empty.
++#include <sys/mman.h>
++#include <stdatomic.h>
++#define GGML_HUGETLB_MAX 256
++static struct { void * p; size_t n; } ggml_hugetlb_tab[GGML_HUGETLB_MAX];
++static atomic_flag ggml_hugetlb_lock = ATOMIC_FLAG_INIT;
++
++static void * ggml_hugetlb_alloc(size_t size) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_HUGETLB");
++        on = e && e[0] == '1';
++    }
++    if (!on) {
++        return NULL;
++    }
++    const size_t n = (size + (2u << 20) - 1) & ~(size_t) ((2u << 20) - 1);
++    void * p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
++    if (p == MAP_FAILED) {
++        return NULL;
++    }
++    while (atomic_flag_test_and_set(&ggml_hugetlb_lock)) {}
++    for (int i = 0; i < GGML_HUGETLB_MAX; i++) {
++        if (!ggml_hugetlb_tab[i].p) {
++            ggml_hugetlb_tab[i].p = p;
++            ggml_hugetlb_tab[i].n = n;
++            atomic_flag_clear(&ggml_hugetlb_lock);
++            return p;
++        }
++    }
++    atomic_flag_clear(&ggml_hugetlb_lock);
++    munmap(p, n);
++    return NULL;
++}
++
++static bool ggml_hugetlb_free(void * ptr) {
++    if (!ptr) {
++        return false;
++    }
++    while (atomic_flag_test_and_set(&ggml_hugetlb_lock)) {}
++    for (int i = 0; i < GGML_HUGETLB_MAX; i++) {
++        if (ggml_hugetlb_tab[i].p == ptr) {
++            const size_t n = ggml_hugetlb_tab[i].n;
++            ggml_hugetlb_tab[i].p = NULL;
++            atomic_flag_clear(&ggml_hugetlb_lock);
++            munmap(ptr, n);
++            return true;
++        }
++    }
++    atomic_flag_clear(&ggml_hugetlb_lock);
++    return false;
++}
++#endif
++
+ void * ggml_aligned_malloc(size_t size) {
+ #if defined(__s390x__)
+     const int alignment = 256;
+@@ -364,6 +425,20 @@ void * ggml_aligned_malloc(size_t size) {
+             result = EFAULT;
+             break;
+     }
++  #elif defined(__linux__)
++    // large buffers (model weights, compute buffers): 2 MiB aligned and backed by transparent huge pages
++    // even when THP is in "madvise" mode -- weights are streamed every token and 4 KiB pages thrash the TLB
++    const bool huge = size >= (32u << 20);
++    if (huge) {
++        void * p = ggml_hugetlb_alloc(size);
++        if (p) {
++            return p;
++        }
++    }
++    int result = posix_memalign(&aligned_memory, huge ? (2u << 20) : alignment, size);
++    if (result == 0 && huge) {
++        madvise(aligned_memory, size, MADV_HUGEPAGE);
++    }
+   #else
+     int result = posix_memalign(&aligned_memory, alignment, size);
+   #endif
+@@ -387,6 +462,11 @@ void * ggml_aligned_malloc(size_t size) {
+ 
+ void ggml_aligned_free(void * ptr, size_t size) {
+     GGML_UNUSED(size);
++#if defined(__linux__)
++    if (ggml_hugetlb_free(ptr)) {
++        return;
++    }
++#endif
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+     _aligned_free(ptr);
+ #elif GGML_USE_CPU_HBM
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc..1b1937f 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -18,6 +18,7 @@ set(LLAMA_CORE_SOURCES
+     llama-cparams.cpp
+     llama-grammar.cpp
+     llama-graph.cpp
++    llama-ep.cpp
+     llama-hparams.cpp
+     llama-impl.cpp
+     llama-io.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 99e55da..a4b556e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-ep.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -3934,6 +3935,7 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+ }
+ 
+ void llama_set_warmup(llama_context * ctx, bool warmup) {
++    if (llama_ep_mirroring()) llama_ep_mirror_op(LLAMA_EP_OP_WARMUP, warmup);
+     ctx->set_warmup(warmup);
+ }
+ 
+@@ -4112,6 +4114,7 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
+     if (!mem) {
+         return;
+     }
++    if (llama_ep_mirroring()) llama_ep_mirror_op(LLAMA_EP_OP_CLEAR, data);
+ 
+     mem->clear(data);
+ }
+@@ -4124,6 +4127,7 @@ bool llama_memory_seq_rm(
+     if (!mem) {
+         return true;
+     }
++    if (llama_ep_mirroring()) llama_ep_mirror_op(LLAMA_EP_OP_SEQ_RM, seq_id, p0, p1);
+ 
+     return mem->seq_rm(seq_id, p0, p1);
+ }
+@@ -4138,6 +4142,7 @@ void llama_memory_seq_cp(
+         return;
+     }
+ 
++    if (llama_ep_mirroring()) llama_ep_mirror_op(LLAMA_EP_OP_SEQ_CP, seq_id_src, seq_id_dst, p0, p1);
+     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+ }
+ 
+@@ -4148,6 +4153,7 @@ void llama_memory_seq_keep(
+         return;
+     }
+ 
++    if (llama_ep_mirroring()) llama_ep_mirror_op(LLAMA_EP_OP_SEQ_KEEP, seq_id);
+     mem->seq_keep(seq_id);
+ }
+ 
+@@ -4161,6 +4167,7 @@ void llama_memory_seq_add(
+         return;
+     }
+ 
++    if (llama_ep_mirroring()) llama_ep_mirror_op(LLAMA_EP_OP_SEQ_ADD, seq_id, p0, p1, delta);
+     mem->seq_add(seq_id, p0, p1, delta);
+ }
+ 
+@@ -4174,6 +4181,7 @@ void llama_memory_seq_div(
+         return;
+     }
+ 
++    if (llama_ep_mirroring()) llama_ep_mirror_op(LLAMA_EP_OP_SEQ_DIV, seq_id, p0, p1, d);
+     mem->seq_div(seq_id, p0, p1, d);
+ }
+ 
+@@ -4350,6 +4358,7 @@ int32_t llama_encode(
+ int32_t llama_decode(
+         llama_context * ctx,
+           llama_batch   batch) {
++    if (llama_ep_mirroring()) llama_ep_mirror_decode(batch, llama_model_n_embd(llama_get_model(ctx)));
+     const int ret = ctx->decode(batch);
+     if (ret != 0 && ret != 1) {
+         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+diff --git a/src/llama-ep.cpp b/src/llama-ep.cpp
+new file mode 100644
+index 0000000..218337e
+--- /dev/null
++++ b/src/llama-ep.cpp
+@@ -0,0 +1,419 @@
++#include "llama-ep.h"
++
++#include "ggml.h"
++#include "llama.h"
++
++#include <arpa/inet.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <algorithm>
++#include <cmath>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++struct ep_state {
++    bool active = false;
++    int  rank   = 0;
++    int  lo     = 0;
++    int  hi     = -1;
++    int  fd     = -1;
++    bool sliced = false;  // model file holds only owned experts, indexed from 0
++    bool tp     = false;
++    bool vsplit = false;
++    bool solo   = false;  // no peer: allreduce is a copy (for single-node compute benchmarks)
++    std::string addr;
++    std::vector<char> rbuf, sbuf;
++    // profiling (LLAMA_EP_PROFILE=1): time computing between syncs vs time inside syncs
++    bool   prof = false;
++    double t_compute = 0, t_sync = 0, t_last_exit = 0;
++    long   n_sync = 0;
++    double t_gather = 0, t_gap = 0, t_gather_exit = 0; long n_gather = 0, n_gap = 0;   // vocab merge; token end -> next token's first sync
++};
++
++double now_s() {
++    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++ep_state & st() {
++    static ep_state s;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        const char * r = getenv("LLAMA_EP_RANK");
++        const char * a = getenv("LLAMA_EP_ADDR");
++        const char * g = getenv("LLAMA_EP_RANGE");
++        const char * m = getenv("LLAMA_EP_MODE");
++        const bool tp_mode = m && std::string(m) == "tp";
++        if (!r || !a || (!g && !tp_mode)) {
++            return;
++        }
++        if (!g) {
++            g = "0-0";
++        }
++        s.rank = atoi(r);
++        s.addr = a;
++        if (sscanf(g, "%d-%d", &s.lo, &s.hi) != 2) {
++            fprintf(stderr, "llama-ep: bad LLAMA_EP_RANGE '%s'\n", g);
++            abort();
++        }
++        s.active = true;
++        s.sliced = getenv("LLAMA_EP_SLICED") != nullptr;
++        s.solo   = s.addr == "solo";
++        s.vsplit = getenv("LLAMA_EP_VOCAB") && std::string(getenv("LLAMA_EP_VOCAB")) == "split";
++        s.tp     = getenv("LLAMA_EP_MODE") && std::string(getenv("LLAMA_EP_MODE")) == "tp";
++        s.prof = getenv("LLAMA_EP_PROFILE") != nullptr;
++        if (s.prof) {
++            atexit([] {
++                auto & p = st();
++                if (p.n_sync) fprintf(stderr, "llama-ep profile: %ld syncs, compute between syncs %.1f ms total, inside syncs %.1f ms total, per sync %.3f ms\n",
++                        p.n_sync, p.t_compute * 1e3, p.t_sync * 1e3, p.t_sync * 1e3 / p.n_sync);
++                if (p.n_gather) fprintf(stderr, "llama-ep profile: %ld vocab merges %.3f ms each; gap from merge to next token's first sync %.3f ms avg (%ld)\n",
++                        p.n_gather, p.t_gather * 1e3 / p.n_gather, p.n_gap ? p.t_gap * 1e3 / p.n_gap : 0.0, p.n_gap);
++            });
++        }
++        fprintf(stderr, "llama-ep: rank %d owns experts %d-%d, peer %s\n", s.rank, s.lo, s.hi, a);
++    });
++    return s;
++}
++
++bool owned(int e) {
++    const auto & s = st();
++    return e >= s.lo && e <= s.hi;
++}
++
++void send_all(int fd, const char * p, size_t n) {
++    while (n) {
++        ssize_t k = ::send(fd, p, n, 0);
++        if (k <= 0) { perror("llama-ep send"); abort(); }
++        p += k; n -= (size_t) k;
++    }
++}
++
++// The peer's half arrives within ~0.1 ms during decoding: spin on a non-blocking recv instead of sleeping in the
++// kernel (a sleeping thread needs a wake-up IPI + reschedule on every sync). Falls back to blocking after ~50 ms.
++void recv_all(int fd, char * p, size_t n) {
++    static const bool spin = [] { const char * e = getenv("LLAMA_EP_SPIN"); return !(e && e[0] == '0'); }();
++    int idle = 0;
++    while (n) {
++        ssize_t k = ::recv(fd, p, n, spin && idle < 200000 ? MSG_DONTWAIT : 0);
++        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { idle++; continue; }
++        if (k <= 0) { perror("llama-ep recv"); abort(); }
++        p += k; n -= (size_t) k; idle = 0;
++    }
++}
++
++int connect_peer() {
++    auto & s = st();
++    if (s.fd >= 0) {
++        return s.fd;
++    }
++    std::string host = s.addr.substr(0, s.addr.rfind(':'));
++    std::string port = s.addr.substr(s.addr.rfind(':') + 1);
++    addrinfo hints = {}, * res = nullptr;
++    hints.ai_socktype = SOCK_STREAM;
++    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) {
++        fprintf(stderr, "llama-ep: cannot resolve %s\n", s.addr.c_str());
++        abort();
++    }
++    int one = 1;
++    if (s.rank == 0) {
++        int l = socket(res->ai_family, SOCK_STREAM, 0);
++        setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++        if (bind(l, res->ai_addr, res->ai_addrlen) != 0 || listen(l, 1) != 0) {
++            perror("llama-ep bind/listen");
++            abort();
++        }
++        fprintf(stderr, "llama-ep: rank 0 waiting for peer on %s\n", s.addr.c_str());
++        s.fd = accept(l, nullptr, nullptr);
++        close(l);
++    } else {
++        for (int attempt = 0; attempt < 600; attempt++) {
++            s.fd = socket(res->ai_family, SOCK_STREAM, 0);
++            if (connect(s.fd, res->ai_addr, res->ai_addrlen) == 0) {
++                break;
++            }
++            close(s.fd);
++            s.fd = -1;
++            usleep(200000);
++        }
++        if (s.fd < 0) {
++            fprintf(stderr, "llama-ep: could not connect to %s\n", s.addr.c_str());
++            abort();
++        }
++    }
++    freeaddrinfo(res);
++    setsockopt(s.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++    fprintf(stderr, "llama-ep: connected to peer\n");
++    return s.fd;
++}
++
++// selected_experts: I32 [n_used, n_tokens] (may be a strided view); dst is contiguous
++void op_remap_ids(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void *) {
++    if (ith != 0) {
++        return;
++    }
++    (void) nth;
++    const int64_t n_used = a->ne[0], n_tok = a->ne[1];
++    const int lo = st().lo;
++    for (int64_t t = 0; t < n_tok; t++) {
++        const char * src = (const char *) a->data + t * a->nb[1];
++        int32_t * out = (int32_t *) ((char *) dst->data + t * dst->nb[1]);
++        const int32_t off = st().sliced ? lo : 0;
++        for (int64_t i = 0; i < n_used; i++) {
++            const int32_t e = *(const int32_t *) (src + i * a->nb[0]);
++            out[i] = owned(e) ? e - off : -1;  // -1: skipped by mul_mat_id / add_id
++        }
++    }
++}
++
++// weights: F32 [1, n_used, n_tokens]; b = selected_experts I32 [n_used, n_tokens]
++void op_mask_weights(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void *) {
++    if (ith != 0) {
++        return;
++    }
++    (void) nth;
++    const int64_t n_used = a->ne[1], n_tok = a->ne[2];
++    for (int64_t t = 0; t < n_tok; t++) {
++        for (int64_t i = 0; i < n_used; i++) {
++            const float w  = *(const float *) ((const char *) a->data + i * a->nb[1] + t * a->nb[2]);
++            const int32_t e = *(const int32_t *) ((const char *) b->data + i * b->nb[0] + t * b->nb[1]);
++            *(float *) ((char *) dst->data + i * dst->nb[1] + t * dst->nb[2]) = owned(e) ? w : 0.0f;
++        }
++    }
++}
++
++// ggml's Q8_0 block layout (ggml-common.h is internal to ggml): fp16 scale + 32 int8 values
++constexpr int QK8_0 = 32;
++struct ep_block_q8 { ggml_fp16_t d; int8_t qs[QK8_0]; };
++static_assert(sizeof(ep_block_q8) == 34, "q8_0 block");
++
++// dst = a + peer's a. a must be contiguous F32.
++void op_allreduce(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void *) {
++    if (ith != 0) {
++        return;
++    }
++    (void) nth;
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
++    const size_t nbytes = ggml_nbytes(a);
++    if (st().solo) {
++        memcpy(dst->data, a->data, nbytes);
++        return;
++    }
++    const int fd = connect_peer();
++    auto & s = st();
++    const double t_enter = s.prof ? now_s() : 0;
++    if (s.prof && s.t_gather_exit > 0) {
++        if (t_enter - s.t_gather_exit < 1.0) { s.t_gap += t_enter - s.t_gather_exit; s.n_gap++; }
++        s.t_gather_exit = 0;
++    }
++    if (s.prof && s.t_last_exit > 0 && t_enter - s.t_last_exit < 1.0) {
++        s.t_compute += t_enter - s.t_last_exit;
++    }
++    // wire format: 8-byte header (element count | F16 flag) + payload, sent in one piece. Payload is fp16 when
++    // every value fits (halves the bytes on the 1 GbE cable); each side picks independently, receiver follows the flag.
++    const size_t n = nbytes / sizeof(float);
++    const float * x = (const float *) a->data;
++    static const bool f16_ok = [] { const char * e = getenv("LLAMA_EP_F16"); return !(e && e[0] == '0'); }();
++    // LLAMA_EP_Q8=1: send Q8_0 blocks (32 int8 + fp16 scale, 1.06 bytes/value) like distributed-llama's q80 buffers
++    static const bool q8_ok = [] { const char * e = getenv("LLAMA_EP_Q8"); return e && e[0] == '1'; }();
++    const bool q8 = q8_ok && n % QK8_0 == 0;
++    bool f16 = f16_ok && !q8;
++    if (f16) {
++        float m = 0.0f;
++        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(x[i]));
++        f16 = m < 60000.0f;
++    }
++    constexpr uint64_t F16_FLAG = 1ull << 63, Q8_FLAG = 1ull << 62;
++    const size_t q8_bytes = n / QK8_0 * sizeof(ep_block_q8);
++    const size_t payload = q8 ? q8_bytes : f16 ? n * sizeof(ggml_fp16_t) : nbytes;
++    if (s.sbuf.size() < 8 + nbytes) s.sbuf.resize(8 + nbytes);
++    if (s.rbuf.size() < nbytes)     s.rbuf.resize(nbytes);
++    const uint64_t hdr = n | (f16 ? F16_FLAG : 0) | (q8 ? Q8_FLAG : 0);
++    memcpy(s.sbuf.data(), &hdr, 8);
++    if (q8)       ggml_quantize_chunk(GGML_TYPE_Q8_0, x, s.sbuf.data() + 8, 0, 1, (int64_t) n, nullptr);
++    else if (f16) ggml_fp32_to_fp16_row(x, (ggml_fp16_t *) (s.sbuf.data() + 8), (int64_t) n);
++    else          memcpy(s.sbuf.data() + 8, x, nbytes);
++
++    uint64_t peer_hdr = 0;
++    auto recv_side = [&] {
++        recv_all(fd, (char *) &peer_hdr, sizeof(peer_hdr));
++        GGML_ASSERT((peer_hdr & ~(F16_FLAG | Q8_FLAG)) == n && "llama-ep: ranks out of sync");
++        recv_all(fd, s.rbuf.data(), (peer_hdr & Q8_FLAG) ? q8_bytes : (peer_hdr & F16_FLAG) ? n * sizeof(ggml_fp16_t) : nbytes);
++    };
++    // full duplex: send on a helper thread for large tensors, inline for small ones
++    if (payload <= 64 * 1024) {
++        send_all(fd, s.sbuf.data(), 8 + payload);
++        recv_side();
++    } else {
++        std::thread sender([&] { send_all(fd, s.sbuf.data(), 8 + payload); });
++        recv_side();
++        sender.join();
++    }
++    float * z = (float *) dst->data;
++    if (peer_hdr & Q8_FLAG) {
++        const ep_block_q8 * y = (const ep_block_q8 *) s.rbuf.data();
++        for (size_t b = 0; b < n / QK8_0; b++) {
++            const float d = ggml_fp16_to_fp32(y[b].d);
++            for (int j = 0; j < QK8_0; j++) z[b * QK8_0 + j] = x[b * QK8_0 + j] + d * y[b].qs[j];
++        }
++    } else if (peer_hdr & F16_FLAG) {
++        const ggml_fp16_t * y = (const ggml_fp16_t *) s.rbuf.data();
++        for (size_t i = 0; i < n; i++) z[i] = x[i] + ggml_fp16_to_fp32(y[i]);
++    } else {
++        const float * y = (const float *) s.rbuf.data();
++        for (size_t i = 0; i < n; i++) z[i] = x[i] + y[i];
++    }
++    if (s.prof) {
++        s.t_last_exit = now_s();
++        s.t_sync += s.t_last_exit - t_enter;
++        s.n_sync++;
++    }
++}
++
++constexpr int EP_TOPK = 64;
++
++// exchange a small buffer with the peer (both send, then both receive)
++void exchange_small(const void * out, size_t n, void * in) {
++    const int fd = connect_peer();
++    const uint64_t hdr = n;
++    send_all(fd, (const char *) &hdr, sizeof(hdr));
++    send_all(fd, (const char *) out, n);
++    uint64_t peer_hdr = 0;
++    recv_all(fd, (char *) &peer_hdr, sizeof(peer_hdr));
++    GGML_ASSERT(peer_hdr == hdr && "llama-ep: ranks out of sync");
++    recv_all(fd, (char *) in, n);
++}
++
++struct idx_val { int32_t i; float v; };
++
++// a: [n_vocab, n_out] with this rank's n_local logits in rows [0, n_local); dst: full logits
++void op_logits_gather(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
++    if (ith != 0) {
++        return;
++    }
++    (void) nth;
++    const int64_t n_vocab = a->ne[0], n_out = a->ne[1];
++    const int64_t n_local = (int64_t) (intptr_t) ud;
++    const double g_t0 = st().prof ? now_s() : 0;
++    const int64_t off     = st().rank * n_local;
++    const int k = (int) std::min<int64_t>(EP_TOPK, n_local);
++    std::vector<idx_val> mine(n_out * k), peer(n_out * k);
++    std::vector<int32_t> order(n_local);
++    for (int64_t c = 0; c < n_out; c++) {
++        const float * own = (const float *) ((const char *) a->data + c * a->nb[1]);
++        float * out = (float *) ((char *) dst->data + c * dst->nb[1]);
++        std::fill(out, out + n_vocab, -INFINITY);
++        std::copy(own, own + n_local, out + off);
++        for (int64_t i = 0; i < n_local; i++) order[i] = (int32_t) i;
++        std::nth_element(order.begin(), order.begin() + k, order.end(), [&](int32_t x, int32_t y) { return own[x] > own[y]; });
++        for (int j = 0; j < k; j++) mine[c * k + j] = { (int32_t) (order[j] + off), own[order[j]] };
++    }
++    if (!st().solo) {
++        exchange_small(mine.data(), mine.size() * sizeof(idx_val), peer.data());
++        for (int64_t c = 0; c < n_out; c++) {
++            float * out = (float *) ((char *) dst->data + c * dst->nb[1]);
++            for (int j = 0; j < k; j++) out[peer[c * k + j].i] = peer[c * k + j].v;
++        }
++    }
++    if (st().prof) {
++        auto & s = st();
++        s.t_gather_exit = now_s();
++        s.t_gather += s.t_gather_exit - g_t0;
++        s.n_gather++;
++    }
++}
++
++int g_ctrl_fd = -1;
++
++int ctrl_fd() {
++    if (g_ctrl_fd >= 0) {
++        return g_ctrl_fd;
++    }
++    const std::string addr = getenv("LLAMA_EP_CTRL");
++    std::string host = addr.substr(0, addr.rfind(':')), port = addr.substr(addr.rfind(':') + 1);
++    addrinfo hints = {}, * res = nullptr;
++    hints.ai_socktype = SOCK_STREAM;
++    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) { fprintf(stderr, "llama-ep: bad LLAMA_EP_CTRL\n"); abort(); }
++    int one = 1;
++    int l = socket(res->ai_family, SOCK_STREAM, 0);
++    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++    if (bind(l, res->ai_addr, res->ai_addrlen) != 0 || listen(l, 1) != 0) { perror("llama-ep ctrl bind"); abort(); }
++    fprintf(stderr, "llama-ep: waiting for follower on control %s\n", addr.c_str());
++    g_ctrl_fd = accept(l, nullptr, nullptr);
++    close(l);
++    freeaddrinfo(res);
++    setsockopt(g_ctrl_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++    fprintf(stderr, "llama-ep: follower attached\n");
++    return g_ctrl_fd;
++}
++
++} // namespace
++
++bool llama_ep_mirroring() {
++    static const bool on = st().active && st().rank == 0 && getenv("LLAMA_EP_CTRL") != nullptr;
++    return on;
++}
++
++void llama_ep_mirror_op(llama_ep_op op, int32_t a0, int32_t a1, int32_t a2, int32_t a3) {
++    const int32_t msg[5] = { (int32_t) op, a0, a1, a2, a3 };
++    send_all(ctrl_fd(), (const char *) msg, sizeof(msg));
++}
++
++void llama_ep_mirror_decode(const llama_batch & b, int n_embd) {
++    const int32_t n = b.n_tokens;
++    const int32_t flags = (b.token ? 1 : 0) | (b.embd ? 2 : 0) | (b.pos ? 4 : 0) | (b.seq_id ? 8 : 0) | (b.logits ? 16 : 0);
++    std::vector<char> buf;
++    auto put = [&](const void * p, size_t sz) { buf.insert(buf.end(), (const char *) p, (const char *) p + sz); };
++    const int32_t hdr[5] = { (int32_t) LLAMA_EP_OP_DECODE, n, flags, n_embd, 0 };
++    put(hdr, sizeof(hdr));
++    if (b.token)  put(b.token, n * sizeof(llama_token));
++    if (b.embd)   put(b.embd, (size_t) n * n_embd * sizeof(float));
++    if (b.pos)    put(b.pos, n * sizeof(llama_pos));
++    if (b.seq_id) {
++        put(b.n_seq_id, n * sizeof(int32_t));
++        for (int32_t i = 0; i < n; i++) put(b.seq_id[i], b.n_seq_id[i] * sizeof(llama_seq_id));
++    }
++    if (b.logits) put(b.logits, n * sizeof(int8_t));
++    send_all(ctrl_fd(), buf.data(), buf.size());
++}
++
++bool llama_ep_active() { return st().active; }
++int  llama_ep_n_vocab_local(int n_vocab) { return st().active && st().vsplit ? n_vocab / 2 : n_vocab; }
++
++ggml_tensor * llama_ep_logits_gather(ggml_context * ctx, ggml_tensor * logits_local, int n_vocab) {
++    const int64_t n_local = logits_local->ne[0];
++    ggml_tensor * padded = ggml_pad(ctx, logits_local, n_vocab - n_local, 0, 0, 0);
++    return ggml_map_custom1(ctx, padded, op_logits_gather, 1, (void *) (intptr_t) n_local);
++}
++
++bool llama_ep_tp()     { return st().active && st().tp; }
++bool llama_ep_attn_split() {
++    static const bool on = [] { const char * e = getenv("LLAMA_EP_ATTN"); return llama_ep_active() && e && std::string(e) == "split"; }();
++    return on;
++}
++int  llama_ep_n_local(int n_expert) { return st().active && st().sliced ? st().hi - st().lo + 1 : n_expert; }
++int  llama_ep_rank()   { return st().rank; }
++
++ggml_tensor * llama_ep_mask_weights(ggml_context * ctx, ggml_tensor * weights, ggml_tensor * selected_experts) {
++    return ggml_map_custom2(ctx, weights, selected_experts, op_mask_weights, 1, nullptr);
++}
++
++ggml_tensor * llama_ep_remap_ids(ggml_context * ctx, ggml_tensor * selected_experts) {
++    return ggml_map_custom1(ctx, selected_experts, op_remap_ids, 1, nullptr);
++}
++
++ggml_tensor * llama_ep_allreduce(ggml_context * ctx, ggml_tensor * t) {
++    return ggml_map_custom1(ctx, ggml_cont(ctx, t), op_allreduce, 1, nullptr);
++}
+diff --git a/src/llama-ep.h b/src/llama-ep.h
+new file mode 100644
+index 0000000..7736cc8
+--- /dev/null
++++ b/src/llama-ep.h
+@@ -0,0 +1,45 @@
++#pragma once
++
++// Expert parallelism across two machines for MoE models (gpt-oss).
++// Each rank owns a contiguous range of experts and only computes those; partial MoE
++// outputs are summed with a direct peer-to-peer exchange after every MoE block.
++// Enabled by environment variables:
++//   LLAMA_EP_RANK   0 or 1
++//   LLAMA_EP_ADDR   host:port  (rank 0 listens on it, rank 1 connects to it)
++//   LLAMA_EP_RANGE  lo-hi      (owned experts, inclusive)
++
++#include <cstdint>
++
++struct ggml_context;
++struct ggml_tensor;
++struct llama_batch;
++
++// Mirroring (leader only, when LLAMA_EP_CTRL=host:port is set): every state-changing libllama call
++// is streamed to the follower before running locally, so both ranks stay in lockstep.
++enum llama_ep_op : int32_t {
++    LLAMA_EP_OP_DECODE = 1, LLAMA_EP_OP_CLEAR, LLAMA_EP_OP_SEQ_RM, LLAMA_EP_OP_SEQ_CP,
++    LLAMA_EP_OP_SEQ_KEEP, LLAMA_EP_OP_SEQ_ADD, LLAMA_EP_OP_SEQ_DIV, LLAMA_EP_OP_WARMUP,
++};
++bool llama_ep_mirroring();
++void llama_ep_mirror_decode(const llama_batch & batch, int n_embd);
++void llama_ep_mirror_op(llama_ep_op op, int32_t a0 = 0, int32_t a1 = 0, int32_t a2 = 0, int32_t a3 = 0);
++
++bool llama_ep_active();
++// LLAMA_EP_MODE=tp: every rank holds half of every expert (n_ff split), no expert masking
++bool llama_ep_tp();
++// LLAMA_EP_ATTN=split: attention heads are split across ranks too (sliced files), partial outputs summed after wo
++bool llama_ep_attn_split();
++// number of experts stored in the local model file (only owned ones when LLAMA_EP_SLICED=1)
++int  llama_ep_n_local(int n_expert);
++int  llama_ep_rank();
++
++// zero routing weights of experts this rank does not own
++ggml_tensor * llama_ep_mask_weights(ggml_context * ctx, ggml_tensor * weights, ggml_tensor * selected_experts);
++// mark non-owned expert picks as -1 so mul_mat_id / add_id skip them (local ids when sliced)
++ggml_tensor * llama_ep_remap_ids(ggml_context * ctx, ggml_tensor * selected_experts);
++// LLAMA_EP_VOCAB=split: each rank's output layer scores half the vocabulary
++int  llama_ep_n_vocab_local(int n_vocab);
++// turn this rank's half-vocab logits into full-size logits: own half exact, peer's top-K filled in, rest -inf
++ggml_tensor * llama_ep_logits_gather(ggml_context * ctx, ggml_tensor * logits_local, int n_vocab);
++// sum a tensor across both ranks (in place semantics: returns the summed tensor)
++ggml_tensor * llama_ep_allreduce(ggml_context * ctx, ggml_tensor * t);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0b3bab6..15921cc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "llama-ep.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -2163,6 +2164,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    if (arch == LLM_ARCH_OPENAI_MOE && llama_ep_active() && !llama_ep_tp()) {
++        // expert parallelism: weights are already normalized over all selected experts,
++        // so zeroing non-owned ones yields this rank's exact share of the MoE output
++        weights          = llama_ep_mask_weights(ctx0, weights, selected_experts);
++        selected_experts = llama_ep_remap_ids(ctx0, selected_experts);
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ab5e744..b5c05ea 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model.h"
++#include "llama-ep.h"
+ 
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+@@ -1798,7 +1799,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    ml.init_mappings(!llama_ep_active(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+diff --git a/src/models/deepseek2.cpp b/src/models/deepseek2.cpp
+index deca865..64c0661 100644
+--- a/src/models/deepseek2.cpp
++++ b/src/models/deepseek2.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "../llama-ep.h"
+ 
+ void llama_model_deepseek2::load_arch_hparams(llama_model_loader & ml) {
+     uint32_t n_vocab = 0;
+@@ -86,7 +87,7 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader & ml) {
+     // output
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+     // try to load output.weight, if not found, use token_embd (tied embeddings)
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, llama_ep_n_vocab_local(n_vocab)}, TENSOR_NOT_REQUIRED);
+     if (!output) {
+         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+     }
+@@ -633,6 +634,9 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+             }
+         }
++        if (llama_ep_tp()) {
++            cur = llama_ep_allreduce(ctx0, cur);  // tensor parallel: each rank computed half of the heads
++        }
+         if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+@@ -681,6 +685,9 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+                 cb(cur, "ffn_out", il);
+             }
+         }
++        if (llama_ep_tp()) {
++            cur = llama_ep_allreduce(ctx0, cur);  // tensor parallel: each rank computed half of every expert / of n_ff
++        }
+         cur = ggml_add(ctx0, cur, ffn_inp);
+ 
+         cur = build_cvec(cur, il);
+@@ -706,6 +713,10 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+     // lm_head
+     cur = ggml_mul_mat(ctx0, model.output, cur);
+ 
++    if (llama_ep_active() && cur->ne[0] != model.tok_embd->ne[1]) {
++        cur = llama_ep_logits_gather(ctx0, cur, (int) model.tok_embd->ne[1]);  // each rank scored half the vocabulary
++    }
++
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ 
+diff --git a/src/models/gemma3.cpp b/src/models/gemma3.cpp
+index f99bbaa..50a473c 100644
+--- a/src/models/gemma3.cpp
++++ b/src/models/gemma3.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "../llama-ep.h"
+ 
+ void llama_model_gemma3::load_arch_hparams(llama_model_loader & ml) {
+     const bool found_swa = ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+@@ -38,7 +39,7 @@ void llama_model_gemma3::load_arch_tensors(llama_model_loader &) {
+ 
+     // output
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, llama_ep_n_vocab_local(n_vocab)}, TENSOR_NOT_REQUIRED);
+ 
+     // if output is NULL, init from the input tok embed
+     if (output == NULL) {
+@@ -154,6 +155,9 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
+             cur = build_attn(inp_attn,
+                     model.layers[il].wo, NULL, model.layers[il].wo_s,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
++            if (llama_ep_tp()) {
++                cur = llama_ep_allreduce(ctx0, cur);  // tensor parallel: each rank computed half of the heads
++            }
+         }
+         if (il == n_layer - 1 && inp_out_ids) {
+             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+@@ -180,6 +184,9 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
+                     model.layers[il].ffn_down, NULL, NULL,
+                     NULL,
+                     LLM_FFN_GELU, LLM_FFN_PAR, il);
++            if (llama_ep_tp()) {
++                cur = llama_ep_allreduce(ctx0, cur);  // tensor parallel: each rank computed half of n_ff
++            }
+             cb(cur, "ffn_out", il);
+         }
+         cur = build_norm(cur,
+@@ -213,6 +220,10 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
+         cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+     }
+ 
++    if (llama_ep_active() && cur->ne[0] != model.tok_embd->ne[1]) {
++        cur = llama_ep_logits_gather(ctx0, cur, (int) model.tok_embd->ne[1]);
++    }
++
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ 
+diff --git a/src/models/mellum.cpp b/src/models/mellum.cpp
+index 3ab7974..a97e479 100644
+--- a/src/models/mellum.cpp
++++ b/src/models/mellum.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "../llama-ep.h"
+ 
+ void llama_model_mellum::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+@@ -31,7 +32,7 @@ void llama_model_mellum::load_arch_tensors(llama_model_loader &) {
+ 
+     // output
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, llama_ep_n_vocab_local(n_vocab)}, 0);
+ 
+     for (int i = 0; i < n_layer; ++i) {
+         auto & layer = layers[i];
+@@ -155,6 +156,9 @@ llama_model_mellum::graph<iswa>::graph(const llama_model & model, const llm_grap
+             cur = build_attn(inp_attn,
+                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
++            if (llama_ep_tp()) {
++                cur = llama_ep_allreduce(ctx0, cur);  // tensor parallel: each rank computed half of the heads
++            }
+         }
+         if (il == n_layer - 1 && inp_out_ids) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+@@ -185,6 +189,9 @@ llama_model_mellum::graph<iswa>::graph(const llama_model & model, const llm_grap
+                     model.layers[il].ffn_up_exps_s,
+                     model.layers[il].ffn_gate_exps_s,
+                     model.layers[il].ffn_down_exps_s);
++        if (llama_ep_tp()) {
++            moe_out = llama_ep_allreduce(ctx0, moe_out);  // tensor parallel: each rank computed half of every expert
++        }
+         cb(moe_out, "ffn_moe_out", il);
+         cur = moe_out;
+ 
+@@ -209,6 +216,10 @@ llama_model_mellum::graph<iswa>::graph(const llama_model & model, const llm_grap
+     // lm_head
+     cur = build_lora_mm(model.output, cur, model.output_s);
+ 
++    if (llama_ep_active() && cur->ne[0] != model.tok_embd->ne[1]) {
++        cur = llama_ep_logits_gather(ctx0, cur, (int) model.tok_embd->ne[1]);  // each rank scored half the vocabulary
++    }
++
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ 
+diff --git a/src/models/openai-moe.cpp b/src/models/openai-moe.cpp
+index 39660a3..2026e82 100644
+--- a/src/models/openai-moe.cpp
++++ b/src/models/openai-moe.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "../llama-ep.h"
+ 
+ void llama_model_openai_moe::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+@@ -23,12 +24,13 @@ void llama_model_openai_moe::load_arch_tensors(llama_model_loader &) {
+     LLAMA_LOAD_LOCALS;
+ 
+     const int64_t n_ff_exp = hparams.n_ff_exp();
++    const int64_t n_expert_file = llama_ep_n_local(n_expert);
+ 
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+ 
+     // output
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, llama_ep_n_vocab_local(n_vocab)}, 0);
+ 
+     for (int i = 0; i < n_layer; ++i) {
+         auto & layer = layers[i];
+@@ -42,16 +44,16 @@ void llama_model_openai_moe::load_arch_tensors(llama_model_loader &) {
+         layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, 0);
+ 
+         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {  n_embd, n_expert}, 0);
+-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
++        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert_file}, 0);
++        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert_file}, 0);
++        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert_file}, 0);
+ 
+         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, 0);
+ 
+         layer.ffn_gate_inp_b  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "bias", i), {n_expert}, 0);
+-        layer.ffn_gate_exps_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff_exp, n_expert}, 0);
+-        layer.ffn_down_exps_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {  n_embd, n_expert}, 0);
+-        layer.ffn_up_exps_b   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "bias", i), {n_ff_exp, n_expert}, 0);
++        layer.ffn_gate_exps_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff_exp, n_expert_file}, 0);
++        layer.ffn_down_exps_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {  n_embd, n_expert_file}, 0);
++        layer.ffn_up_exps_b   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "bias", i), {n_ff_exp, n_expert_file}, 0);
+     }
+ }
+ 
+@@ -113,6 +115,9 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
+                     Qcur, Kcur, Vcur, nullptr, model.layers[il].attn_sinks, nullptr, 1.0f/sqrtf(float(n_rot)), il);
+ 
+             cb(cur, "attn_out", il);
++            if (llama_ep_attn_split()) {
++                cur = llama_ep_allreduce(ctx0, cur);  // each rank computed half of the heads
++            }
+         }
+         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+             // skip computing output for unused tokens
+@@ -140,6 +145,9 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
+                 hparams.expert_weights_scale,
+                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT,
+                 il);
++        if (llama_ep_active()) {
++            cur = llama_ep_allreduce(ctx0, cur);
++        }
+         cb(cur, "ffn_moe_out", il);
+ 
+         cur = ggml_add(ctx0, cur, ffn_inp);
+@@ -167,6 +175,9 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
+ 
+     // lm_head
+     cur = build_lora_mm(model.output, cur, model.output_s);
++    if (llama_ep_active() && cur->ne[0] != model.tok_embd->ne[1]) {
++        cur = llama_ep_logits_gather(ctx0, cur, (int) model.tok_embd->ne[1]);
++    }
+ 
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+diff --git a/src/models/qwen2.cpp b/src/models/qwen2.cpp
+index e9c2ea8..56414de 100644
+--- a/src/models/qwen2.cpp
++++ b/src/models/qwen2.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "../llama-ep.h"
+ 
+ void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+@@ -23,7 +24,7 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
+ 
+     // output
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, llama_ep_n_vocab_local(n_vocab)}, TENSOR_NOT_REQUIRED);
+     output_b    = create_tensor(tn(LLM_TENSOR_OUTPUT,      "bias"),   {n_vocab}, TENSOR_NOT_REQUIRED);
+     // if output is NULL, init from the input tok embed
+     if (output == NULL) {
+@@ -35,8 +36,9 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+ 
+-        create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
+-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
++        // attention width is n_head * head_dim (not n_embd) so tensor-parallel slices with half the heads load
++        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
++        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+ 
+         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+ 
+@@ -102,6 +104,9 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+             cur = build_attn(inp_attn,
+                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
++            if (llama_ep_tp()) {
++                cur = llama_ep_allreduce(ctx0, cur);  // tensor parallel: each rank computed half of the heads
++            }
+         }
+         if (il == n_layer - 1 && inp_out_ids) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+@@ -122,6 +127,9 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+                 model.layers[il].ffn_down, NULL, NULL,
+                 NULL,
+                 LLM_FFN_SILU, LLM_FFN_PAR, il);
++        if (llama_ep_tp()) {
++            cur = llama_ep_allreduce(ctx0, cur);  // tensor parallel: each rank computed half of n_ff
++        }
+         cb(cur, "ffn_out", il);
+ 
+         cur = ggml_add(ctx0, cur, ffn_inp);
+@@ -147,6 +155,10 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+     if (model.output_b != nullptr) {
+         cur = ggml_add(ctx0, cur, model.output_b);
+     }
++    if (llama_ep_active() && cur->ne[0] != model.tok_embd->ne[1]) {
++        cur = llama_ep_logits_gather(ctx0, cur, (int) model.tok_embd->ne[1]);  // each rank scored half the vocabulary
++    }
++
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ 
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index c8ad1db..0326150 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -18,6 +18,7 @@ else()
+     add_subdirectory(gguf-split)
+     add_subdirectory(imatrix)
+     add_subdirectory(llama-bench)
++    add_subdirectory(ep-run)
+     add_subdirectory(completion)
+     add_subdirectory(perplexity)
+     add_subdirectory(quantize)
+diff --git a/tools/ep-run/CMakeLists.txt b/tools/ep-run/CMakeLists.txt
+new file mode 100644
+index 0000000..0b76a0d
+--- /dev/null
++++ b/tools/ep-run/CMakeLists.txt
+@@ -0,0 +1,4 @@
++set(TARGET llama-ep-run)
++add_executable(${TARGET} ep-run.cpp)
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/ep-run/ep-run.cpp b/tools/ep-run/ep-run.cpp
+new file mode 100644
+index 0000000..d1ef495
+--- /dev/null
++++ b/tools/ep-run/ep-run.cpp
+@@ -0,0 +1,222 @@
++// ep-run: expert/tensor parallel gpt-oss across two machines.
++//   leader  (LLAMA_EP_RANK=0): runs a prompt; libllama mirrors every decode/memory call to the follower
++//           (any libllama program works as leader when LLAMA_EP_CTRL is set, e.g. llama-server)
++//   follower (LLAMA_EP_RANK=1, --follow): replays the mirrored calls so both ranks stay in lockstep
++// Peer data link and model split are configured with LLAMA_EP_* env vars (see src/llama-ep.h).
++
++#include "llama.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#include <netdb.h>
++#include <netinet/tcp.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static void die(const char * m) { fprintf(stderr, "ep-run: %s\n", m); exit(1); }
++
++// returns false on clean EOF before any byte
++// While generating, the leader's next instruction arrives within ~1 ms: spin (non-blocking recv) for up to 20 ms so
++// node2 starts the next token without a sleep/wake-up; after that block, so an idle follower uses no CPU.
++static bool recv_all(int fd, void * p, size_t n) {
++    char * c = (char *) p;
++    size_t got = 0;
++    auto t0 = std::chrono::steady_clock::now();
++    bool spin = true;
++    while (got < n) {
++        ssize_t k = recv(fd, c + got, n - got, spin ? MSG_DONTWAIT : 0);
++        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(20)) spin = false;
++            continue;
++        }
++        if (k == 0 && got == 0) return false;
++        if (k <= 0) die("control connection lost");
++        got += (size_t) k;
++        t0 = std::chrono::steady_clock::now();
++    }
++    return true;
++}
++
++static int connect_ctrl(const std::string & addr) {
++    std::string host = addr.substr(0, addr.rfind(':')), port = addr.substr(addr.rfind(':') + 1);
++    addrinfo hints = {}, * res = nullptr;
++    hints.ai_socktype = SOCK_STREAM;
++    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) die("resolve ctrl addr");
++    int fd = -1, one = 1;
++    for (int i = 0; i < 3000 && fd < 0; i++) {
++        fd = socket(res->ai_family, SOCK_STREAM, 0);
++        if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); fd = -1; usleep(200000); }
++    }
++    freeaddrinfo(res);
++    if (fd < 0) die("connect ctrl");
++    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++    return fd;
++}
++
++static void follow(int cfd, llama_context * ctx) {
++    llama_memory_t mem = llama_get_memory(ctx);
++    std::vector<llama_token> tok; std::vector<float> embd; std::vector<llama_pos> pos;
++    std::vector<int32_t> nsid; std::vector<llama_seq_id> sid; std::vector<llama_seq_id *> sidp; std::vector<int8_t> logits;
++    int32_t h[5];
++    long n_decode = 0;
++    while (recv_all(cfd, h, sizeof(h))) {
++        switch (h[0]) {
++            case 1: {  // decode
++                const int32_t n = h[1], flags = h[2], n_embd = h[3];
++                llama_batch b = {};
++                b.n_tokens = n;
++                if (flags & 1)  { tok.resize(n);  recv_all(cfd, tok.data(), n * sizeof(llama_token)); b.token = tok.data(); }
++                if (flags & 2)  { embd.resize((size_t) n * n_embd); recv_all(cfd, embd.data(), embd.size() * sizeof(float)); b.embd = embd.data(); }
++                if (flags & 4)  { pos.resize(n);  recv_all(cfd, pos.data(), n * sizeof(llama_pos)); b.pos = pos.data(); }
++                if (flags & 8)  {
++                    nsid.resize(n); recv_all(cfd, nsid.data(), n * sizeof(int32_t));
++                    size_t tot = 0; for (int32_t v : nsid) tot += v;
++                    sid.resize(tot); sidp.resize(n);
++                    size_t off = 0;
++                    for (int32_t i = 0; i < n; i++) { sidp[i] = sid.data() + off; recv_all(cfd, sidp[i], nsid[i] * sizeof(llama_seq_id)); off += nsid[i]; }
++                    b.n_seq_id = nsid.data(); b.seq_id = sidp.data();
++                }
++                if (flags & 16) { logits.resize(n); recv_all(cfd, logits.data(), n); b.logits = logits.data(); }
++                llama_decode(ctx, b);
++                n_decode++;
++                break;
++            }
++            case 2: llama_memory_clear(mem, h[1]); break;
++            case 3: llama_memory_seq_rm(mem, h[1], h[2], h[3]); break;
++            case 4: llama_memory_seq_cp(mem, h[1], h[2], h[3], h[4]); break;
++            case 5: llama_memory_seq_keep(mem, h[1]); break;
++            case 6: llama_memory_seq_add(mem, h[1], h[2], h[3], h[4]); break;
++            case 7: llama_memory_seq_div(mem, h[1], h[2], h[3], h[4]); break;
++            case 8: llama_set_warmup(ctx, h[1]); break;
++            default: die("unknown mirrored op");
++        }
++    }
++    fprintf(stderr, "ep-run: leader disconnected after %ld decodes\n", n_decode);
++}
++
++int main(int argc, char ** argv) {
++    std::string model_path, prompt = "Explain in two sentences why the sky is blue.", ctrl;
++    int n_predict = 64, n_threads = 4, n_ctx = 4096;
++    bool repack = false, no_mmap = false, follower = false, tmpl = false, swa_small = false;
++    int poll = 50, prio = 0; std::string cpumask;
++    for (int i = 1; i < argc; i++) {
++        std::string a = argv[i];
++        if (a == "-m" && i + 1 < argc) model_path = argv[++i];
++        else if (a == "-p" && i + 1 < argc) prompt = argv[++i];
++        else if (a == "-n" && i + 1 < argc) n_predict = atoi(argv[++i]);
++        else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
++        else if (a == "-c" && i + 1 < argc) n_ctx = atoi(argv[++i]);
++        else if (a == "--ctrl" && i + 1 < argc) ctrl = argv[++i];
++        else if (a == "--repack") repack = true;
++        else if (a == "--no-mmap") no_mmap = true;
++        else if (a == "--follow") follower = true;
++        else if (a == "--tmpl") tmpl = true;
++        else if (a == "--swa-small") swa_small = true;
++        else if (a == "--poll" && i + 1 < argc) poll = atoi(argv[++i]);      // 0..100: how long idle workers spin before sleeping
++        else if (a == "--prio" && i + 1 < argc) prio = atoi(argv[++i]);      // 0 normal, 1 medium, 2 high, 3 realtime
++        else if (a == "--cpumask" && i + 1 < argc) cpumask = argv[++i];      // e.g. "0,1,2": pin worker i to the i-th listed cpu  // sliding-window layers keep only the window (the leader runs without --swa-full)  // use the model's own chat template instead of the gpt-oss harmony prompt
++    }
++    if (model_path.empty() || !getenv("LLAMA_EP_RANK")) die("usage: LLAMA_EP_*=... ep-run -m model [--ctrl host:port] [--follow] [-p prompt] [-n N] [-t threads]");
++    const char * addr_env = getenv("LLAMA_EP_ADDR");
++    const bool solo = addr_env && std::string(addr_env) == "solo";
++    if (!solo && ctrl.empty()) die("--ctrl is required unless LLAMA_EP_ADDR=solo");
++    if (!follower && !solo) setenv("LLAMA_EP_CTRL", ctrl.c_str(), 1);  // libllama mirrors calls to the follower
++
++    const int cfd = follower ? connect_ctrl(ctrl) : -1;
++
++    llama_backend_init();
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers    = 0;
++    mp.load_mode       = no_mmap ? LLAMA_LOAD_MODE_NONE : LLAMA_LOAD_MODE_MMAP;
++    mp.use_extra_bufts = repack;  // only safe with a sliced model: repacking copies every expert in the file into RAM
++    llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
++    if (!model) die("load model");
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    llama_context_params cp = llama_context_default_params();
++    cp.n_ctx = n_ctx; cp.n_batch = 512; cp.n_ubatch = 512;
++    cp.n_threads = n_threads; cp.n_threads_batch = n_threads;
++    cp.swa_full = !swa_small;   // must match the leader: llama-server --swa-full (default here) or not (--swa-small)
++    llama_context * ctx = llama_init_from_model(model, cp);
++    if (!ctx) die("create context");
++
++    // a persistent thread pool (like llama-server's): without one, ggml creates and joins fresh worker threads for
++    // every graph, i.e. for every token
++    ggml_threadpool_params tpp;
++    ggml_threadpool_params_init(&tpp, n_threads);
++    tpp.poll = poll;
++    tpp.prio = (ggml_sched_priority) prio;
++    if (!cpumask.empty()) {
++        size_t pos = 0;
++        while (pos < cpumask.size()) {
++            const int c = atoi(cpumask.c_str() + pos);
++            if (c >= 0 && c < GGML_MAX_N_THREADS) tpp.cpumask[c] = true;
++            pos = cpumask.find(',', pos);
++            if (pos == std::string::npos) break;
++            pos++;
++        }
++        tpp.strict_cpu = true;
++    }
++    ggml_threadpool * tp = ggml_threadpool_new(&tpp);
++    if (!tp) die("threadpool");
++    llama_attach_threadpool(ctx, tp, nullptr);
++    fprintf(stderr, "ep-run: thread pool %d threads, poll %d, prio %d%s%s\n", n_threads, poll, prio,
++            cpumask.empty() ? "" : ", cpus ", cpumask.c_str());
++
++    if (follower) {
++        follow(cfd, ctx);
++    } else {
++        std::string text = "<|start|>system<|message|>Reasoning: low<|end|><|start|>user<|message|>" + prompt +
++                           "<|end|><|start|>assistant";
++        if (tmpl) {
++            const llama_chat_message msg = { "user", prompt.c_str() };
++            std::vector<char> buf(prompt.size() * 2 + 1024);
++            const int len = llama_chat_apply_template(llama_model_chat_template(model, nullptr), &msg, 1, true, buf.data(), buf.size());
++            if (len < 0 || len > (int) buf.size()) die("chat template");
++            text.assign(buf.data(), len);
++        }
++        std::vector<llama_token> toks(text.size() + 16);
++        int n = llama_tokenize(vocab, text.c_str(), text.size(), toks.data(), toks.size(), false, true);
++        if (n < 0) die("tokenize");
++        toks.resize(n);
++
++        auto t0 = std::chrono::steady_clock::now();
++        if (llama_decode(ctx, llama_batch_get_one(toks.data(), toks.size()))) die("decode prompt");
++        auto t1 = std::chrono::steady_clock::now();
++
++        const int n_vocab = llama_vocab_n_tokens(vocab);
++        int generated = 0;
++        auto tg0 = t1;
++        for (int i = 0; i < n_predict; i++) {
++            const float * lg = llama_get_logits_ith(ctx, -1);
++            llama_token best = 0;
++            for (int v = 1; v < n_vocab; v++) if (lg[v] > lg[best]) best = v;
++            if (i == 0) tg0 = std::chrono::steady_clock::now();
++            char buf[256];
++            int k = llama_token_to_piece(vocab, best, buf, sizeof(buf), 0, true);
++            if (k > 0) { fwrite(buf, 1, k, stdout); fflush(stdout); }
++            generated++;
++            if (llama_vocab_is_eog(vocab, best)) break;
++            if (llama_decode(ctx, llama_batch_get_one(&best, 1))) die("decode token");
++        }
++        auto tg1 = std::chrono::steady_clock::now();
++        const double pp_s = std::chrono::duration<double>(t1 - t0).count();
++        const double tg_s = std::chrono::duration<double>(tg1 - tg0).count();
++        fprintf(stderr, "\n\nep-run: prompt %d tokens in %.2fs (%.1f t/s) | generated %d tokens, %.2f t/s\n",
++                (int) toks.size(), pp_s, toks.size() / pp_s, generated, (generated - 1) / tg_s);
++    }
++    llama_free(ctx);
++    ggml_threadpool_free(tp);
++    llama_model_free(model);
++    llama_backend_free();
++    if (cfd >= 0) close(cfd);
++    return 0;
++}

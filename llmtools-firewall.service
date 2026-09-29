@@ -1,0 +1,12 @@
+[Unit]
+Description=Firewall for the AI sandbox user: only the netgate permission proxy is reachable
+After=network-pre.target ufw.service
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/llmtools-firewall
+
+[Install]
+WantedBy=multi-user.target

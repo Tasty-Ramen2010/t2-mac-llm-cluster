@@ -1,0 +1,59 @@
+{#- DeepSeek-Coder-V2 conversation format ("User: ... Assistant: ...<eos>") with Hermes-style tools added.
+    The model's own template has no tools, so llama-server dropped them and the model never knew it could run code. -#}
+{{- bos_token }}
+{%- if messages[0]['role'] == 'system' %}
+    {{- messages[0]['content'] }}
+{%- endif %}
+{%- if tools %}
+    {{- "\n\n# Tools\n\nYou can call functions to actually run code, read and write files, and search the web. You are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nTo call a function, reply with a json object with the function name and arguments within <tool_call></tool_call> XML tags, and nothing after it:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\nThe result comes back in <tool_response></tool_response> tags. Never invent a function's output: call it and wait for the real result." }}
+{%- endif %}
+{%- if messages[0]['role'] == 'system' or tools %}
+    {{- "\n\n" }}
+{%- endif %}
+{%- for message in messages %}
+    {%- if message.role == "user" %}
+        {{- 'User: ' + message.content + '\n\n' }}
+    {%- elif message.role == "system" and not loop.first %}
+        {{- message.content + '\n\n' }}
+    {%- elif message.role == "assistant" %}
+        {{- 'Assistant:' }}
+        {%- if message.content %}
+            {{- ' ' + message.content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '\n<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- eos_token }}
+    {%- elif message.role == "tool" %}
+        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}
+            {{- 'User:' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '\n\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- 'Assistant:' }}
+{%- endif %}

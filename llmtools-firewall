@@ -1,0 +1,10 @@
+#!/bin/sh
+# The AI sandbox user (llmtools) may only talk to netgate (127.0.0.1:8899), which asks the user before any website.
+# Everything else it tries (direct internet, DNS, the LAN, Tailscale, local services) is rejected.
+set -e
+for T in iptables ip6tables; do
+  $T -N LLMTOOLS 2>/dev/null || $T -F LLMTOOLS
+  if [ $T = iptables ]; then $T -A LLMTOOLS -o lo -d 127.0.0.1 -p tcp --dport 8899 -j ACCEPT; fi
+  $T -A LLMTOOLS -j REJECT
+  $T -C OUTPUT -m owner --uid-owner llmtools -j LLMTOOLS 2>/dev/null || $T -I OUTPUT 1 -m owner --uid-owner llmtools -j LLMTOOLS
+done

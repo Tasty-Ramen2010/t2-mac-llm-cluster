@@ -1,0 +1,8 @@
+smoke	A 67% (2/3)	B -	A avg 20.4s 162 tok	B avg 0.0s	gen 15.5 t/s	total 1.0 min
+gptoss20b-low	A 80% (32/40)	B 80% (8/10)	A avg 29.1s 310 tok	B avg 87.5s	gen 14.4 t/s	total 34.0 min
+gptoss20b-medium	A 80% (32/40)	B 70% (7/10)	A avg 96.6s 1122 tok	B avg 168.4s	gen 16.6 t/s	total 92.5 min
+mellum	A 88% (35/40)	B 40% (4/10)	A avg 31.7s 268 tok	B avg 28.1s	gen 20.6 t/s	total 25.8 min
+mellum-think	A 85% (34/40)	B 80% (8/10)	A avg 60.8s 1035 tok	B avg 149.2s	gen 19.7 t/s	total 65.4 min
+qcoder7	A 85% (34/40)	B 60% (6/10)	A avg 26.8s 200 tok	B avg 45.5s	gen 8.9 t/s	total 25.5 min
+qcoder14	A 80% (32/40)	B 100% (10/10)	A avg 68.9s 261 tok	B avg 86.5s	gen 4.5 t/s	total 60.4 min
+dscoder	A 82% (33/40)	B 70% (7/10)	A avg 19.1s 319 tok	B avg 12.8s	gen 20.1 t/s	total 14.9 min

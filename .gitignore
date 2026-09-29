@@ -1,0 +1,40 @@
+# private user data — never publish
+agent/chats/
+agent/logs/
+agent/permissions.json
+# build / runtime artifacts
+__pycache__/
+*.pyc
+*.bak
+*.bak*
+# large model files and benchmark data dumps
+*.gguf
+models/
+bench/speed/*.jsonl
+bench/speed/*.json
+bench/results/*.live.jsonl
+gpu/*.data
+shots-tmp/
+# compiled test binaries (source .c/.cl are kept)
+gpu/attnbench
+gpu/cpugemm
+gpu/f16bench
+gpu/gemmbench
+gpu/gemvbench
+gpu/gpubw
+gpu/intpeak
+gpu/peak
+gpu/vcheck
+gpu/*.config
+lowlevel/membw
+lowlevel/pingpong
+lowlevel/udppong
+perf/bw
+perf/gemvbench
+ep/ep-run
+# unrelated experiments and stray logs
+hybridock/
+demos/
+logs/
+perf/*.log
+*.log

@@ -1,0 +1,523 @@
+{
+ "label": "gptoss20b-medium",
+ "args": {
+  "label": "gptoss20b-medium",
+  "n": 40,
+  "effort": "medium",
+  "temp": 0.3,
+  "max_tokens": 6000,
+  "parts": "AB"
+ },
+ "results": [
+  {
+   "part": "A",
+   "id": "HumanEval/82",
+   "pass": true,
+   "seconds": 14.1,
+   "gen_tokens": 186,
+   "gen_tps": 17.5,
+   "answer": "```python\ndef prime_length(string):\n    \"\"\"\n    Return True if the length of the input string is a prime number, otherwise False.\n    \"\"\"\n    n = len(string)\n    if n <= 1:\n        return False\n    # Check divisibility up to sqrt(n)\n    import math\n    limit = int(math.isqrt(n))\n    for i in range(2, limit + 1):\n        if n % i == 0:\n            return False\n    return True\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/115",
+   "pass": true,
+   "seconds": 49.8,
+   "gen_tokens": 700,
+   "gen_tps": 16.7,
+   "answer": "```python\ndef max_fill(grid, capacity):\n    \"\"\"\n    Calculate the minimum number of times a bucket must be lowered to empty all wells.\n\n    Each row in `grid` represents a well. A value of 1 in a row indicates a unit of water.\n    A bucket can hold up to `capacity` units of water. For each well we need\n    ceil(number_of_ones / capacity) bucket lowers. The total number of lowers is the sum\n    over all wells.\n\n    Parameters\n    ----------\n    grid : List[List[int]]\n        2D list where each inner list contains 0s and 1s.\n    capacity : int\n        Capacity of each bucket (positive integer).\n\n    Returns\n    -------\n    int\n        Total number of bucket lowers required to empty all wells.\n    \"\"\"\n    if not grid:\n        return 0\n\n    total_lowers = 0\n    for row in grid:\n        ones = sum(row)\n        if ones:\n            # ceil division: (ones + capacity - 1) // capacity\n            total_lowers += (ones + capacity - 1) // capacity\n    return total_lowers\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/92",
+   "pass": true,
+   "seconds": 33.0,
+   "gen_tokens": 489,
+   "gen_tps": 17.1,
+   "answer": "```python\ndef any_int(x, y, z):\n    \"\"\"\n    Return True if one of the three arguments equals the sum of the other two,\n    and all arguments are integers. Otherwise return False.\n    \"\"\"\n    # Ensure all values are integers (and not booleans)\n    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (x, y, z)):\n        return False\n\n    # Check the three possible equalities\n    if x == y + z or y == x + z or z == x + y:\n        return True\n    return False\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/161",
+   "pass": true,
+   "seconds": 40.7,
+   "gen_tokens": 636,
+   "gen_tps": 17.3,
+   "answer": "```python\ndef solve(s):\n    \"\"\"\n    You are given a string s.\n    If s[i] is a letter, reverse its case from lower to upper or vice versa,\n    otherwise keep it as it is.\n    If the string contains no letters, reverse the string.\n    The function should return the resulted string.\n    Examples\n    solve(\"1234\") = \"4321\"\n    solve(\"ab\") = \"AB\"\n    solve(\"#a@C\") = \"#A@c\"\n    \"\"\"\n    # Determine if the string contains at least one alphabetic character\n    contains_letter = any(ch.isalpha() for ch in s)\n\n    if contains_letter:\n        # Toggle case for each alphabetic character\n        return ''.join(ch.upper() if ch.islower() else ch.lower() for ch in s)\n    else:\n        # No letters: reverse the entire string\n        return s[::-1]\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/47",
+   "pass": true,
+   "seconds": 25.9,
+   "gen_tokens": 395,
+   "gen_tps": 17.5,
+   "answer": "```python\ndef median(l: list):\n    \"\"\"Return median of elements in the list l.\n    >>> median([3, 1, 2, 4, 5])\n    3\n    >>> median([-10, 4, 6, 1000, 10, 20])\n    15.0\n    \"\"\"\n    if not l:\n        raise ValueError(\"median requires a non\u2011empty list\")\n\n    sorted_l = sorted(l)\n    n = len(sorted_l)\n    mid = n // 2\n\n    if n % 2:  # odd number of elements\n        return sorted_l[mid]\n    else:  # even number of elements\n        return (sorted_l[mid - 1] + sorted_l[mid]) / 2\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/51",
+   "pass": true,
+   "seconds": 24.7,
+   "gen_tokens": 362,
+   "gen_tps": 17.6,
+   "answer": "```python\ndef remove_vowels(text):\n    \"\"\"\n    remove_vowels is a function that takes string and returns string without vowels.\n    >>> remove_vowels('')\n    ''\n    >>> remove_vowels(\"abcdef\\\\nghijklm\")\n    'bcdf\\\\nghjklm'\n    >>> remove_vowels('abcdef')\n    'bcdf'\n    >>> remove_vowels('aaaaa')\n    ''\n    >>> remove_vowels('aaBAA')\n    'B'\n    >>> remove_vowels('zbcd')\n    'zbcd'\n    \"\"\"\n    # Define vowels (both lowercase and uppercase)\n    vowels = set('aeiouAEIOU')\n    # Build result by filtering out vowels\n    return ''.join(ch for ch in text if ch not in vowels)\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/50",
+   "pass": false,
+   "seconds": 24.5,
+   "gen_tokens": 360,
+   "gen_tps": 17.5,
+   "answer": "```python\ndef decode_shift(s: str):\n    \"\"\"\n    takes as input string encoded with encode_shift function. Returns decoded string.\n    \"\"\"\n    return \"\".join([chr(((ord(ch) - 5 - ord(\"a\")) % 26) + ord(\"a\")) for ch in s])\n```\n",
+   "log": "\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 26, in <module>\n  File \"<string>\", line 21, in check\nNameError: name 'encode_shift' is not defined. Did you mean: 'decode_shift'?\n"
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/146",
+   "pass": true,
+   "seconds": 78.0,
+   "gen_tokens": 1229,
+   "gen_tps": 16.6,
+   "answer": "```python\ndef specialFilter(nums):\n    \"\"\"\n    Returns the number of elements in the array that are greater than 10\n    and have both first and last digits odd (1, 3, 5, 7, 9).\n    \"\"\"\n    count = 0\n    for n in nums:\n        # Must be greater than 10\n        if n <= 10:\n            continue\n        # Work with the absolute value to handle negative numbers\n        s = str(abs(n))\n        first_digit = int(s[0])\n        last_digit = int(s[-1])\n        if first_digit % 2 == 1 and last_digit % 2 == 1:\n            count += 1\n    return count\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/36",
+   "pass": true,
+   "seconds": 49.0,
+   "gen_tokens": 782,
+   "gen_tps": 17.1,
+   "answer": "```python\ndef fizz_buzz(n: int) -> int:\n    \"\"\"\n    Return the number of times the digit 7 appears in integers less than n\n    which are divisible by 11 or 13.\n\n    >>> fizz_buzz(50)\n    0\n    >>> fizz_buzz(78)\n    2\n    >>> fizz_buzz(79)\n    3\n    \"\"\"\n    if n <= 0:\n        return 0\n\n    count = 0\n    for i in range(1, n):\n        if i % 11 == 0 or i % 13 == 0:\n            count += str(i).count('7')\n    return count\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/109",
+   "pass": false,
+   "seconds": 59.4,
+   "gen_tokens": 861,
+   "gen_tps": 16.6,
+   "answer": "```python\ndef move_one_ball(arr):\n    \"\"\"\n    Determine whether the given list can be made non\u2011decreasing by only performing\n    right cyclic shifts (rotations).  The list contains unique elements.\n    \n    A list is a rotation of a sorted ascending list iff it has at most one\n    \u201cdrop\u201d where an element is greater than the following element (wrapping\n    around from the last element to the first).  If there is no drop the list\n    is already sorted.  If there is exactly one drop, rotating the list so that\n    the drop becomes the last element yields a sorted list.\n    \"\"\"\n    n = len(arr)\n    if n <= 1:\n        return True\n\n    # Find positions where the order is broken\n    drops = []\n    for i in range(n):\n        if arr[i] > arr[(i + 1) % n]:\n            drops.append(i)\n\n    # More than one drop \u2192 impossible\n    if len(drops) > 1:\n        return False\n\n    # No drop \u2192 already sorted\n    if len(drops) == 0:\n        return True\n\n    # Exactly one drop: rotate to start after the drop\n    start = (drops[0] + 1) % n\n    for i in range(n):\n        if arr[(start + i) % n] > arr[(start + i + 1) % n]:\n            return False\n\n    return True\n```",
+   "log": "\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 50, in <module>\n  File \"<string>\", line 42, in check\nAssertionError: This prints if this assert fails 1 (good for debugging!)\n"
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/81",
+   "pass": false,
+   "seconds": 237.9,
+   "gen_tokens": 3298,
+   "gen_tps": 14.3,
+   "answer": "```python\ndef numerical_letter_grade(grades):\n    \"\"\"\n    Convert a list of GPA values into their corresponding letter grades.\n\n    Parameters\n    ----------\n    grades : list[float]\n        A list of GPA values.\n\n    Returns\n    -------\n    list[str]\n        A list of letter grades that correspond to the input GPAs.\n    \"\"\"\n    grades = []\n    for g in grades:\n        if g == 4.0:\n            grades.append('A+')\n        elif g > 3.7:\n            grades.append('A')\n        elif g > 3.3:\n            grades.append('A-')\n        elif g > 3.0:\n            grades.append('B+')\n        elif g > 2.7:\n            grades.append('B')\n        elif g > 2.3:\n            grades.append('B-')\n        elif g > 2.0:\n            grades.append('C+')\n        elif g > 1.7:\n            grades.append('C')\n        elif g > 1.3:\n            grades.append('C-')\n        elif g > 1.0:\n            grades.append('D+')\n        elif g > 0.7:\n            grades.append('D')\n        elif g > 0.0:\n            grades.append('D-')\n        else:  # g <= 0.0\n            grades.append('E')\n    return grades\n```",
+   "log": "\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 61, in <module>\n  File \"<string>\", line 49, in check\nAssertionError\n"
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/30",
+   "pass": true,
+   "seconds": 31.1,
+   "gen_tokens": 460,
+   "gen_tps": 17.0,
+   "answer": "```python\ndef get_positive(l: list):\n    \"\"\"Return only positive numbers in the list.\n    >>> get_positive([-1, 2, -4, 5, 6])\n    [2, 5, 6]\n    >>> get_positive([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10])\n    [5, 3, 2, 3, 9, 123, 1]\n    \"\"\"\n    return [x for x in l if x > 0]\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/61",
+   "pass": true,
+   "seconds": 21.7,
+   "gen_tokens": 310,
+   "gen_tps": 17.3,
+   "answer": "```python\ndef correct_bracketing(brackets: str) -> bool:\n    \"\"\"\n    Return True if every opening bracket has a corresponding closing bracket,\n    otherwise False.\n\n    A simple stack\u2011like approach: keep a counter of open brackets.\n    Increment for '(' and decrement for ')'.  If the counter becomes\n    negative at any point, there is a closing bracket without a matching\n    opening one.  At the end the counter must be zero for the string to\n    be balanced.\n    \"\"\"\n    open_count = 0\n    for ch in brackets:\n        if ch == '(':\n            open_count += 1\n        elif ch == ')':\n            open_count -= 1\n            if open_count < 0:\n                return False\n        else:\n            # ignore any other characters (though the problem states only '(' and ')')\n            continue\n    return open_count == 0\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/105",
+   "pass": true,
+   "seconds": 78.7,
+   "gen_tokens": 1115,
+   "gen_tps": 15.6,
+   "answer": "```python\ndef by_length(arr):\n    \"\"\"\n    Given an array of integers, sort the integers that are between 1 and 9 inclusive,\n    reverse the resulting array, and then replace each digit by its corresponding name from\n    \"One\", \"Two\", \"Three\", \"Four\", \"Five\", \"Six\", \"Seven\", \"Eight\", \"Nine\".\n\n    For example:\n      arr = [2, 1, 1, 4, 5, 8, 2, 3]   \n            -> sort arr -> [1, 1, 2, 2, 3, 4, 5, 8] \n            -> reverse arr -> [8, 5, 4, 3, 2, 2, 1, 1]\n      return [\"Eight\", \"Five\", \"Four\", \"Three\", \"Two\", \"Two\", \"One\", \"One\"]\n    \n      If the array is empty, return an empty array:\n      arr = []\n      return []\n    \n      If the array has any strange number ignore it:\n      arr = [1, -1 , 55] \n            -> sort arr -> [-1, 1, 55]\n            -> reverse arr -> [55, 1, -1]\n      return = ['One']\n    \"\"\"\n    # Keep only numbers in the inclusive range 1-9\n    filtered = [x for x in arr if 1 <= x <= 9]\n    if not filtered:\n        return []\n\n    # Sort ascending\n    filtered.sort()\n    # Reverse the sorted list\n    filtered.reverse()\n\n    # Mapping from number to name\n    names = [\"One\", \"Two\", \"Three\", \"Four\", \"Five\", \"Six\", \"Seven\", \"Eight\", \"Nine\"]\n    return [names[x - 1] for x in filtered]\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/144",
+   "pass": true,
+   "seconds": 644.2,
+   "gen_tokens": 623,
+   "gen_tps": 16.4,
+   "answer": "```python\ndef simplify(x, n):\n    \"\"\"\n    Return True if the product of the two fractions represented by the strings `x` and `n`\n    evaluates to a whole number, otherwise return False.\n\n    Parameters\n    ----------\n    x : str\n        A string in the form \"numerator/denominator\".\n    n : str\n        A string in the form \"numerator/denominator\".\n\n    Returns\n    -------\n    bool\n        True if the product of the two fractions is an integer, False otherwise.\n    \"\"\"\n    # Parse the two fractions\n    a, b = map(int, x.split('/'))\n    c, d = map(int, n.split('/'))\n\n    # Compute the product\n    numerator = a * c\n    denominator = b * d\n\n    # The product is an integer iff the denominator divides the numerator\n    return numerator % denominator == 0\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/95",
+   "pass": true,
+   "seconds": 54.9,
+   "gen_tokens": 836,
+   "gen_tps": 16.8,
+   "answer": "```python\ndef check_dict_case(d):\n    \"\"\"\n    Given a dictionary, return True if all keys are strings in lower \n    case or all keys are strings in upper case, else return False.\n    The function should return False if the given dictionary is empty.\n    \"\"\"\n    # Empty dictionary returns False\n    if not d:\n        return False\n\n    # Ensure all keys are strings\n    for key in d:\n        if not isinstance(key, str):\n            return False\n\n    # Check if all keys are lower case or all keys are upper case\n    all_lower = all(key.islower() for key in d)\n    all_upper = all(key.isupper() for key in d)\n\n    return all_lower or all_upper\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/45",
+   "pass": true,
+   "seconds": 20.1,
+   "gen_tokens": 305,
+   "gen_tps": 17.6,
+   "answer": "```python\ndef triangle_area(a, h):\n    \"\"\"Given length of a side and height return area for a triangle.\n\n    >>> triangle_area(5, 3)\n    7.5\n    \"\"\"\n    return 0.5 * a * h\n```\n",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/87",
+   "pass": true,
+   "seconds": 63.3,
+   "gen_tokens": 941,
+   "gen_tps": 16.6,
+   "answer": "```python\ndef get_row(lst, x):\n    \"\"\"\n    Find all occurrences of integer `x` in a jagged 2\u2011D list `lst` and\n    return a list of tuples `(row_index, col_index)`.\n\n    The result is sorted first by row index in ascending order, and for\n    each row the column indices are sorted in descending order.\n\n    Parameters\n    ----------\n    lst : list[list[int]]\n        A list of lists (rows) that may have different lengths.\n    x : int\n        The integer value to search for.\n\n    Returns\n    -------\n    list[tuple[int, int]]\n        A list of `(row, column)` tuples as described above.\n    \"\"\"\n    # Collect all coordinates where the element equals x\n    coords = []\n    for row_index, row in enumerate(lst):\n        for col_index, val in enumerate(row):\n            if val == x:\n                coords.append((row_index, col_index))\n\n    # Sort by row ascending, then by column descending\n    coords.sort(key=lambda t: (t[0], -t[1]))\n    return coords\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/132",
+   "pass": false,
+   "seconds": 477.8,
+   "gen_tokens": 6000,
+   "gen_tps": 12.7,
+   "answer": "",
+   "log": "\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 39, in <module>\n  File \"<string>\", line 20, in check\nAssertionError: This prints if this assert fails 1 (good for debugging!)\n"
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/158",
+   "pass": true,
+   "seconds": 41.7,
+   "gen_tokens": 641,
+   "gen_tps": 17.1,
+   "answer": "```python\ndef find_max(words):\n    \"\"\"\n    Return the word with the maximum number of unique characters.\n    If multiple words tie, return the lexicographically smallest one.\n    If the input list is empty, return an empty string.\n    \"\"\"\n    best_word = \"\"\n    max_unique = -1\n\n    for word in words:\n        unique_count = len(set(word))\n        if unique_count > max_unique or (unique_count == max_unique and word < best_word):\n            max_unique = unique_count\n            best_word = word\n\n    return best_word\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/32",
+   "pass": true,
+   "seconds": 76.9,
+   "gen_tokens": 1144,
+   "gen_tps": 16.3,
+   "answer": "```python\nimport math\n\n\ndef poly(xs: list, x: float):\n    \"\"\"\n    Evaluates polynomial with coefficients xs at point x.\n    return xs[0] + xs[1] * x + xs[1] * x^2 + .... xs[n] * x^n\n    \"\"\"\n    return sum([coeff * math.pow(x, i) for i, coeff in enumerate(xs)])\n\n\ndef find_zero(xs: list):\n    \"\"\"\n    xs are coefficients of a polynomial.\n    find_zero finds x such that poly(x) = 0.\n    find_zero returns only one zero point, even if there are many.\n    Moreover, find_zero only takes list xs having even number of coefficients\n    and largest non zero coefficient as it guarantees a solution.\n    >>> round(find_zero([1, 2]), 2) # f(x) = 1 + 2x\n    -0.5\n    >>> round(find_zero([-6, 11, -6, 1]), 2) # (x - 1) * (x - 2) * (x - 3) = -6 + 11x - 6x^2 + x^3\n    1.0\n    \"\"\"\n    # Helper to evaluate polynomial\n    def f(x):\n        return poly(xs, x)\n\n    # Find an interval where the function changes sign\n    left, right = -1.0, 1.0\n    f_left, f_right = f(left), f(right)\n\n    # Expand interval until a sign change is found\n    while f_left * f_right > 0:  # same sign\n        left -= 1\n        right += 1\n        f_left, f_right = f(left), f(right)\n\n    # Binary search for a root within the interval\n    for _ in range(100):  # enough iterations for double precision\n        mid = (left + right) / 2\n        f_mid = f(mid)\n        if f_mid == 0:\n            return mid\n        if f_left * f_mid <= 0:\n            right, f_right = mid, f_mid\n        else:\n            left, f_left = mid, f_mid\n\n    return (left + right) / 2\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/73",
+   "pass": true,
+   "seconds": 33.8,
+   "gen_tokens": 495,
+   "gen_tps": 17.2,
+   "answer": "```python\ndef smallest_change(arr):\n    \"\"\"\n    Given an array arr of integers, find the minimum number of elements that\n    need to be changed to make the array palindromic. A palindromic array is an array that\n    is read the same backwards and forwards. In one change, you can change one element to any other element.\n\n    For example:\n    smallest_change([1,2,3,5,4,7,9,6]) == 4\n    smallest_change([1, 2, 3, 4, 3, 2, 2]) == 1\n    smallest_change([1, 2, 3, 2, 1]) == 0\n    \"\"\"\n    n = len(arr)\n    changes = 0\n    for i in range(n // 2):\n        if arr[i] != arr[n - 1 - i]:\n            changes += 1\n    return changes\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/96",
+   "pass": false,
+   "seconds": 38.7,
+   "gen_tokens": 583,
+   "gen_tps": 17.2,
+   "answer": "```python\ndef count_up_to(n):\n    \"\"\"\n    Return a list of all prime numbers that are strictly less than ``n```.\n    The function accepts a non\u2011negative integer ``n```.  If ``n`` is less than 2 the result is an empty list.\n\n    Examples\n    ----------\n    >>> count_up_to(5)\n    [2, 3]\n    >>> count_up_to(11)\n    [2, 3, 5, 7]\n    >>> count_up_to(20)\n    [2, 3, 5, 7, 11, 13, 17, 19]\n    >>> count_up_to(0)\n    []\n    >>> count_up_to(1)\n    []\n    >>> count_up_to(18)\n    [2, 3, 5, 7, 11, 13, 17]\n    \"\"\"\n    if n <= 2:\n        return []\n\n    def is_prime(num: int) -> bool:\n        \"\"\"Return True if ``num`` is a prime number.\"\"\"\n        if num < 2:\n            return False\n        if num in (2, 3):\n            return True\n        if num % 2 == 0 or num % 3 == 0:\n            return False\n        i = 5\n        while i * i <= num:\n            if num % i == 0 or num % (i + 2) == 0:\n                return False\n            i += 6\n        return True\n\n    primes = []\n    for candidate in range(2, n):\n        if is_prime(candidate):\n            primes.append(candidate)\n    return primes\n```",
+   "log": "\n[stderr]\n  File \"<string>\", line 2\n    \"\"\"\n    ^\nSyntaxError: unterminated triple-quoted string literal (detected at line 21)\n"
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/40",
+   "pass": true,
+   "seconds": 32.2,
+   "gen_tokens": 468,
+   "gen_tps": 17.2,
+   "answer": "```python\ndef triples_sum_to_zero(l: list) -> bool:\n    \"\"\"\n    triples_sum_to_zero takes a list of integers as an input.\n    it returns True if there are three distinct elements in the list that\n    sum to zero, and False otherwise.\n\n    >>> triples_sum_to_zero([1, 3, 5, 0])\n    False\n    >>> triples_sum_to_zero([1, 3, -2, 1])\n    True\n    >>> triples_sum_to_zero([1, 2, 3, 7])\n    False\n    >>> triples_sum_to_zero([2, 4, -5, 3, 9, 7])\n    True\n    >>> triples_sum_to_zero([1])\n    False\n    \"\"\"\n    n = len(l)\n    if n < 3:\n        return False\n\n    # Brute\u2011force search for any triple of distinct indices whose sum is zero.\n    for i in range(n):\n        for j in range(i + 1, n):\n            for k in range(j + 1, n):\n                if l[i] + l[j] + l[k] == 0:\n                    return True\n    return False\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/74",
+   "pass": true,
+   "seconds": 17.9,
+   "gen_tokens": 213,
+   "gen_tps": 17.2,
+   "answer": "```python\ndef total_match(lst1, lst2):\n    \"\"\"\n    Return the list that has a smaller total number of characters in all its strings.\n    If both lists have the same total number of characters, return the first list.\n    \"\"\"\n    # Compute total number of characters for each list\n    total1 = sum(len(s) for s in lst1)\n    total2 = sum(len(s) for s in lst2)\n\n    # Return the list with smaller total; if equal, return first list\n    return lst1 if total1 <= total2 else lst2\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/145",
+   "pass": false,
+   "seconds": 486.1,
+   "gen_tokens": 6000,
+   "gen_tps": 12.4,
+   "answer": "",
+   "log": "\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 30, in <module>\n  File \"<string>\", line 18, in check\nAssertionError\n"
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/64",
+   "pass": true,
+   "seconds": 30.9,
+   "gen_tokens": 449,
+   "gen_tps": 16.9,
+   "answer": "```python\ndef vowels_count(s: str) -> int:\n    \"\"\"\n    Count the number of vowels in a string.\n    Vowels are 'a', 'e', 'i', 'o', 'u'.  The letter 'y' is considered a vowel only if it is the last character of the string.\n    The function is case\u2011insensitive.\n    \"\"\"\n    if not s:\n        return 0\n\n    # Count standard vowels\n    vowels = set(\"aeiou\")\n    count = 0\n    for ch in s:\n        if ch.lower() in vowels:\n            count += 1\n\n    # Count a trailing 'y' if present\n    if s[-1].lower() == 'y':\n        count += 1\n\n    return count\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/52",
+   "pass": true,
+   "seconds": 21.7,
+   "gen_tokens": 319,
+   "gen_tps": 17.4,
+   "answer": "```python\ndef below_threshold(l: list, t: int) -> bool:\n    \"\"\"\n    Return True if all numbers in the list ``l`` are below the threshold ``t``.\n    >>> below_threshold([1, 2, 4, 10], 100)\n    True\n    >>> below_threshold([1, 20, 4, 10], 5)\n    False\n    \"\"\"\n    return all(x < t for x in l)\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/70",
+   "pass": true,
+   "seconds": 34.5,
+   "gen_tokens": 518,
+   "gen_tps": 17.1,
+   "answer": "```python\ndef strange_sort_list(lst):\n    \"\"\"\n    Given a list of integers, return a new list where the elements are\n    arranged in a \"strange\" order: start with the smallest element, then\n    the largest remaining element, then the next smallest, then the next\n    largest, and so on.\n\n    Parameters\n    ----------\n    lst : list[int]\n        List of integers to be sorted.\n\n    Returns\n    -------\n    list[int]\n        A new list containing the same elements as `lst` but arranged in\n        the described order.\n    \"\"\"\n    # Make a copy so the original list is not modified\n    sorted_lst = sorted(lst)\n\n    result = []\n    left, right = 0, len(sorted_lst) - 1\n\n    while left <= right:\n        # Append the smallest remaining element\n        result.append(sorted_lst[left])\n        left += 1\n\n        # Append the largest remaining element, if any left\n        if left <= right:\n            result.append(sorted_lst[right])\n            right -= 1\n\n    return result\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/91",
+   "pass": true,
+   "seconds": 55.2,
+   "gen_tokens": 862,
+   "gen_tps": 16.8,
+   "answer": "```python\nimport re\n\ndef is_bored(S: str) -> int:\n    \"\"\"\n    Count the number of sentences that start with the word \"I\".\n\n    Sentences are delimited by '.', '?' or '!'.\n\n    Parameters\n    ----------\n    S : str\n        A string containing a sequence of words.\n\n    Returns\n    -------\n    int\n        The number of sentences that start with the word \"I\".\n    \"\"\"\n    # Split the text into sentences using the delimiters.\n    # The regex splits on the delimiters but keeps the delimiters as separators.\n    sentences = re.split(r'[.!?]', S)\n\n    bored_count = 0\n    for sentence in sentences:\n        # Remove leading/trailing whitespace\n        sentence = sentence.strip()\n        if not sentence:\n            continue\n\n        # Check if the first word is exactly \"I\"\n        if sentence.startswith(\"I\"):\n            # Ensure that the first word is only \"I\" and not part of another word.\n            if len(sentence) == 1 or sentence[1] == ' ':\n                bored_count += 1\n\n    return bored_count\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/57",
+   "pass": true,
+   "seconds": 42.4,
+   "gen_tokens": 666,
+   "gen_tps": 17.2,
+   "answer": "```python\ndef monotonic(l: list) -> bool:\n    \"\"\"\n    Return True if the list elements are monotonically increasing or decreasing.\n\n    A list is considered monotonic if all consecutive differences have the same sign\n    (all non\u2011negative or all non\u2011positive).  Empty lists and lists with a single element\n    are considered monotonic.\n\n    Examples\n    --------\n    >>> monotonic([1, 2, 4, 20])\n    True\n    >>> monotonic([1, 20, 4, 10])\n    False\n    >>> monotonic([4, 1, 0, -10])\n    True\n    \"\"\"\n    if len(l) <= 1:\n        return True\n\n    # Compute differences between consecutive elements\n    diffs = [l[i + 1] - l[i] for i in range(len(l) - 1)]\n\n    # Determine if all differences are non\u2011negative or all are non\u2011positive\n    all_non_negative = all(d >= 0 for d in diffs)\n    all_non_positive = all(d <= 0 for d in diffs)\n\n    return all_non_negative or all_non_positive\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/148",
+   "pass": false,
+   "seconds": 483.2,
+   "gen_tokens": 6000,
+   "gen_tps": 12.6,
+   "answer": "",
+   "log": "\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 36, in <module>\n  File \"<string>\", line 23, in check\nTypeError: object of type 'NoneType' has no len()\n"
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/94",
+   "pass": true,
+   "seconds": 69.4,
+   "gen_tokens": 1025,
+   "gen_tps": 16.5,
+   "answer": "```python\nimport math\n\ndef skjkasdkd(lst):\n    \"\"\"Find the largest prime in the list and return the sum of its digits.\"\"\"\n    def is_prime(n: int) -> bool:\n        \"\"\"Return True if n is a prime number.\"\"\"\n        if n < 2:\n            return False\n        if n in (2, 3):\n            return True\n        if n % 2 == 0 or n % 3 == 0:\n            return False\n        # Check divisibility by numbers of the form 6k \u00b1 1\n        limit = int(math.isqrt(n))\n        i = 5\n        while i <= limit:\n            if n % i == 0 or n % (i + 2) == 0:\n                return False\n            i += 6\n        return True\n\n    max_prime = None\n    for num in lst:\n        if is_prime(num):\n            if max_prime is None or num > max_prime:\n                max_prime = num\n\n    if max_prime is None:\n        return 0\n\n    # Sum the digits of the largest prime\n    return sum(int(d) for d in str(max_prime))\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/98",
+   "pass": true,
+   "seconds": 30.1,
+   "gen_tokens": 467,
+   "gen_tps": 17.4,
+   "answer": "```python\ndef count_upper(s):\n    \"\"\"\n    Given a string s, count the number of uppercase vowels in even indices.\n    \n    For example:\n    count_upper('aBCdEf') returns 1\n    count_upper('abcdefg') returns 0\n    count_upper('dBBE') returns 0\n    \"\"\"\n    # Define the set of uppercase vowels\n    uppercase_vowels = set('AEIOU')\n    count = 0\n    for i, ch in enumerate(s):\n        if i % 2 == 0 and ch in uppercase_vowels:\n            count += 1\n    return count\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/13",
+   "pass": true,
+   "seconds": 35.7,
+   "gen_tokens": 557,
+   "gen_tps": 17.2,
+   "answer": "```python\ndef greatest_common_divisor(a: int, b: int) -> int:\n    \"\"\"Return the greatest common divisor (greatest common divisor) of two integers a and b.\n\n    The function implements the Euclidean algorithm.  It works for negative numbers as well as for zero.\n\n    >>> greatest_common_divisor(3, 5)\n    1\n    >>> greatest_common_divisor(25, 15)\n    5\n    >>> greatest_common_divisor(0, 5)\n    5\n    >>> greatest_common_divisor(0, 0)\n    0\n    \"\"\"\n    # Handle the trivial case where both numbers are zero\n    if a == 0 and b == 0:\n        return 0\n\n    # Euclidean algorithm \u2013 keep swapping until the remainder is zero\n    while b != 0:\n        a, b = b, a % b\n\n    # The greatest common divisor is the absolute value of the last non\u2011zero remainder\n    return abs(a)\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/129",
+   "pass": true,
+   "seconds": 128.8,
+   "gen_tokens": 1870,
+   "gen_tps": 15.6,
+   "answer": "```python\ndef minPath(grid, k):\n    \"\"\"\n    Finds the lexicographically minimal path of length k in a grid that contains\n    each integer from 1 to N*N exactly once.\n\n    The algorithm is greedy: start from the cell that contains the value 1\n    (the smallest possible first element).  From the current cell, always move to\n    a neighbouring cell that has the smallest value among the neighbours.  Because\n    any cell can be extended to a path of any length by simply bouncing back and\n    forth, the greedy choice guarantees that the resulting sequence of values is\n    the lexicographically smallest one.\n\n    Parameters\n    ----------\n    grid : List[List[int]]\n        A square grid of size N x N with each integer from 1 to N*N appearing\n        exactly once.\n    k : int\n        Length of the path to be found (k >= 1).\n\n    Returns\n    -------\n    List[int]\n        The list of values along the lexicographically minimal path of length k.\n    \"\"\"\n    n = len(grid)\n    # Find the coordinates of the cell that contains the value 1\n    start_i = start_j = None\n    for i in range(n):\n        for j in range(n):\n            if grid[i][j] == 1:\n                start_i, start_j = i, j\n                break\n        if start_i is not None:\n            break\n\n    # If the grid does not contain 1 (should not happen), just return empty list\n    if start_i is None:\n        return []\n\n    # Directions: up, down, left, right\n    dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]\n\n    # Build the path\n    path = [grid[start_i][start_j]]\n    cur_i, cur_j = start_i, start_j\n\n    for _ in range(k - 1):\n        # Find neighbour with minimal value\n        min_val = None\n        next_i = next_j = None\n        for di, dj in dirs:\n            ni, nj = cur_i + di, cur_j + dj\n            if 0 <= ni < n and 0 <= nj < n:\n                val = grid[ni][nj]\n                if min_val is None or val < min_val:\n                    min_val = val\n                    next_i, next_j = ni, nj\n        # Move to the chosen neighbour\n        path.append(min_val)\n        cur_i, cur_j = next_i, next_j\n\n    return path\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/101",
+   "pass": true,
+   "seconds": 69.4,
+   "gen_tokens": 1090,
+   "gen_tps": 16.7,
+   "answer": "```python\nimport re\n\ndef words_string(s: str) -> list[str]:\n    \"\"\"\n    Split a string into words separated by commas or spaces.\n    \"\"\"\n    # Strip leading/trailing spaces and commas\n    cleaned = s.strip(' ,')\n    if not cleaned:\n        return []\n\n    # Split on any sequence of spaces or commas\n    parts = re.split(r'[\\s,]+', cleaned)\n    # Filter out any empty strings that may appear\n    return [p for p in parts if p]\n```\n",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/151",
+   "pass": true,
+   "seconds": 32.3,
+   "gen_tokens": 478,
+   "gen_tps": 17.3,
+   "answer": "```python\ndef double_the_difference(lst):\n    \"\"\"\n    Given a list of numbers, return the sum of squares of the numbers\n    in the list that are odd. Ignore numbers that are negative or not integers.\n\n    Examples:\n        double_the_difference([1, 3, 2, 0]) == 1 + 9 + 0 + 0 = 10\n        double_the_difference([-1, -2, 0]) == 0\n        double_the_difference([9, -2]) == 81\n        double_the_difference([0]) == 0\n    If the input list is empty, return 0.\n    \"\"\"\n    total = 0\n    for num in lst:\n        # Only consider integers that are non\u2011negative and odd\n        if isinstance(num, int) and num >= 0 and num % 2 == 1:\n            total += num * num\n    return total\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/28",
+   "pass": true,
+   "seconds": 16.2,
+   "gen_tokens": 234,
+   "gen_tps": 17.8,
+   "answer": "```python\nfrom typing import List\n\n\ndef concatenate(strings: List[str]) -> str:\n    \"\"\"Concatenate list of strings into a single string\n    >>> concatenate([])\n    ''\n    >>> concatenate(['a', 'b', 'c'])\n    'abc'\n    \"\"\"\n    return ''.join(strings)\n```",
+   "log": ""
+  },
+  {
+   "part": "A",
+   "id": "HumanEval/103",
+   "pass": false,
+   "seconds": 59.4,
+   "gen_tokens": 919,
+   "gen_tps": 16.8,
+   "answer": "```python\ndef rounded_avg(n, m):\n    \"\"\"Compute the average of all integers from n to m inclusive.\n    If n > m return -1.  Otherwise return the binary representation\n    of the rounded average (rounded down to the nearest integer using integer division).\"\"\"\n    if n > m:\n        return -1\n    # Compute the average using integer division (floor)\n    avg = (n + m) // 2\n    return bin(avg)\n```",
+   "log": "\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 33, in <module>\n  File \"<string>\", line 19, in check\nAssertionError\n"
+  },
+  {
+   "part": "B",
+   "id": "binary_search",
+   "pass": true,
+   "seconds": 149.3,
+   "gen_tokens": 1179,
+   "tool_calls": 4,
+   "steps": 5,
+   "answer": "Here is the corrected implementation of the binary\u2011search helper:\n\n```python\ndef find(xs, target):\n    lo, hi = 0, len(xs)\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if xs[mid] == target:\n            return mid\n        elif xs[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid\n    return -1\n```\n\nThis version correctly narrows the search interval (`lo = mid + 1` or `hi = mid`) so the loop always converges, and it returns `-1` when the target is absent.",
+   "log": ""
+  },
+  {
+   "part": "B",
+   "id": "median",
+   "pass": true,
+   "seconds": 38.5,
+   "gen_tokens": 506,
+   "tool_calls": 1,
+   "steps": 2,
+   "answer": "```python\ndef median(xs):\n    \"\"\"Return the median of a non\u2011empty list of numbers.\n\n    The function does **not** modify the caller\u2019s list and\n    returns the average of the two middle values when the length\n    is even.\n    \"\"\"\n    if not xs:\n        raise ValueError(\"List must not be empty\")\n\n    # Work on a sorted copy so the original list is untouched\n    xs_sorted = sorted(xs)\n    n = len(xs_sorted)\n    mid = n // 2\n\n    # Odd length: middle element\n    if n % 2 == 1:\n        return xs_sorted[mid]\n\n    # Even length: average of the two middle elements\n    return (xs_sorted[mid - 1] + xs_sorted[mid]) / 2\n```",
+   "log": ""
+  },
+  {
+   "part": "B",
+   "id": "word_count",
+   "pass": true,
+   "seconds": 31.8,
+   "gen_tokens": 402,
+   "tool_calls": 1,
+   "steps": 2,
+   "answer": "```python\nimport string\n\ndef word_count(text):\n    counts = {}\n    for w in text.split():\n        # Normalize the word: lower\u2011case and strip surrounding punctuation\n        w_clean = w.lower().strip(string.punctuation)\n        if w_clean:           # ignore empty strings that may arise from punctuation only\n            counts[w_clean] = counts.get(w_clean, 0) + 1\n    return counts\n```\n",
+   "log": ""
+  },
+  {
+   "part": "B",
+   "id": "transpose",
+   "pass": true,
+   "seconds": 31.3,
+   "gen_tokens": 445,
+   "tool_calls": 1,
+   "steps": 2,
+   "answer": "```python\ndef transpose(m):\n    \"\"\"Return the transpose of a rectangular matrix given as a list of rows.\"\"\"\n    if not m:                     # handle empty matrix\n        return []\n\n    n = len(m)                     # number of rows\n    m0len = len(m[0])              # number of columns (assume all rows same length)\n\n    return [[m[j][i] for j in range(n)] for i in range(m0len)]\n```\n",
+   "log": ""
+  },
+  {
+   "part": "B",
+   "id": "roman",
+   "pass": true,
+   "seconds": 74.1,
+   "gen_tokens": 1082,
+   "tool_calls": 1,
+   "steps": 2,
+   "answer": "Here is the corrected implementation that correctly handles subtractive Roman numeral forms:\n\n```python\ndef to_int(s):\n    vals = {\"I\": 1, \"V\": 5, \"X\": 10, \"L\": 50, \"C\": 100, \"D\": 500, \"M\": 1000}\n    total = 0\n    i = 0\n    while i < len(s):\n        # If the next symbol has a larger value, this is a subtractive pair\n        if i + 1 < len(s) and vals[s[i]] < vals[s[i + 1]]:\n            total += vals[s[i + 1]] - vals[s[i]]\n            i += 2\n        else:\n            total += vals[s[i]]\n            i += 1\n    return total\n```\n\nThis function now correctly interprets Roman numerals such as `IV` \u2192\u202f4, `XL` \u2192\u202f40, `CM` \u2192\u202f900, etc.",
+   "log": ""
+  },
+  {
+   "part": "B",
+   "id": "merge_intervals",
+   "pass": false,
+   "seconds": 139.7,
+   "gen_tokens": 1793,
+   "tool_calls": 8,
+   "steps": 8,
+   "answer": "",
+   "log": "no code block"
+  },
+  {
+   "part": "B",
+   "id": "flatten",
+   "pass": false,
+   "seconds": 481.2,
+   "gen_tokens": 6000,
+   "tool_calls": 0,
+   "steps": 1,
+   "answer": "",
+   "log": "no code block"
+  },
+  {
+   "part": "B",
+   "id": "rle",
+   "pass": true,
+   "seconds": 96.8,
+   "gen_tokens": 1220,
+   "tool_calls": 6,
+   "steps": 7,
+   "answer": "Here is a corrected implementation of the run\u2011length encoder that handles all edge cases:\n\n```python\ndef rle(s):\n    # Empty string \u2192 empty result\n    if not s:\n        return \"\"\n\n    out = \"\"\n    count = 1\n\n    # Walk through the string, counting consecutive identical characters\n    for i in range(1, len(s)):\n        if s[i] == s[i - 1]:\n            count += 1\n        else:\n            # Emit the previous character and its run length\n            out += s[i - 1] + str(count)\n            count = 1\n\n    # Emit the final run\n    out += s[-1] + str(count)\n    return out\n```\n\nThis version correctly appends the final run, handles empty strings, and works for all input strings.",
+   "log": ""
+  },
+  {
+   "part": "B",
+   "id": "moving_average",
+   "pass": true,
+   "seconds": 194.7,
+   "gen_tokens": 2769,
+   "tool_calls": 1,
+   "steps": 2,
+   "answer": "Here is the corrected implementation:\n\n```python\ndef moving_average(xs, k):\n    # Return an empty list if the window size is larger than the input list\n    if k > len(xs):\n        return []\n\n    # Compute the first window's sum and record its average\n    out = []\n    total = sum(xs[:k])\n    out.append(total / k)\n\n    # Slide the window across the list\n    for i in range(k, len(xs)):\n        # Update the running sum: add the new element and remove the element that falls out of the window\n        total += xs[i] - xs[i - k]\n        # Record the average for the current window\n        out.append(total / k)\n\n    return out\n```\n\nThis version correctly returns all sliding\u2011window averages and handles the case where the window size exceeds the input list length.",
+   "log": ""
+  },
+  {
+   "part": "B",
+   "id": "parse_duration",
+   "pass": false,
+   "seconds": 446.4,
+   "gen_tokens": 5671,
+   "tool_calls": 0,
+   "steps": 1,
+   "answer": "I\u2019m sorry, but I\u2019m unable to provide a correct answer at the moment.",
+   "log": "no code block"
+  }
+ ]
+}

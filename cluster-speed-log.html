@@ -1,0 +1,327 @@
+<title>Mac Mini Cluster Speed Log</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root {
+  --bg: #eef1ef;
+  --surface: #f8faf9;
+  --ink: #18201c;
+  --muted: #56615b;
+  --line: #cfd8d3;
+  --accent: #1f7a57;
+  --accent-soft: #d6ebe1;
+  --before: #b9c3be;
+  --warn: #a8631a;
+  --bad: #b23b3b;
+  --display: "Archivo", "Arial Narrow", system-ui, sans-serif;
+  --body: "Source Sans 3", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111614; --surface: #182019; --ink: #e2e9e5; --muted: #9aa8a0; --line: #2c3731;
+    --accent: #5cc29a; --accent-soft: #1d3a2e; --before: #3d4a44; --warn: #e0a256; --bad: #e07a7a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111614; --surface: #182019; --ink: #e2e9e5; --muted: #9aa8a0; --line: #2c3731;
+  --accent: #5cc29a; --accent-soft: #1d3a2e; --before: #3d4a44; --warn: #e0a256; --bad: #e07a7a;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 17px/1.55 var(--body); padding-inline: 16px; padding-block: 0 64px; }
+.wrap { max-width: 920px; margin: 0 auto; }
+header { padding-block: 44px 20px; border-bottom: 2px solid var(--ink); }
+.kicker { font: 600 12px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+h1 { font: 800 clamp(34px, 6vw, 56px)/1.02 var(--display); font-stretch: 78%; margin: 12px 0 14px; text-wrap: balance; letter-spacing: -.01em; }
+h2 { font: 750 28px/1.1 var(--display); font-stretch: 82%; margin: 0 0 6px; text-wrap: balance; }
+h3 { font: 700 18px/1.2 var(--display); font-stretch: 90%; margin: 22px 0 8px; }
+p { margin: 0 0 12px; max-width: 68ch; }
+.lede { font-size: 19px; color: var(--muted); max-width: 64ch; }
+section { padding-block: 40px 8px; border-bottom: 1px solid var(--line); }
+.sub { color: var(--muted); margin-bottom: 18px; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-top: 26px; }
+.stat { background: var(--surface); border: 1px solid var(--line); padding: 14px 16px 12px; }
+.stat .v { font: 700 30px/1.05 var(--display); font-stretch: 80%; }
+.stat .v small { font: 600 14px var(--mono); color: var(--muted); margin-left: 4px; }
+.stat .v .from { color: var(--muted); font-weight: 600; }
+.stat .l { color: var(--muted); font-size: 14.5px; margin-top: 6px; line-height: 1.35; }
+.chart { background: var(--surface); border: 1px solid var(--line); padding: 16px 16px 10px; margin: 10px 0 18px; }
+.chart svg { display: block; width: 100%; height: auto; }
+.chart .cap { font-size: 14px; color: var(--muted); margin-top: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13.5px; color: var(--muted); margin-bottom: 8px; }
+.legend i { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; }
+.tbl { overflow-x: auto; margin: 8px 0 18px; }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th { font: 600 12px/1.3 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--ink); white-space: nowrap; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td.n, th.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.win td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+tr.big td { font-weight: 600; }
+.up { color: var(--accent); font-weight: 600; }
+.down { color: var(--bad); font-weight: 600; }
+.flat { color: var(--muted); }
+.pill { display: inline-block; font: 600 11px/1 var(--mono); letter-spacing: .05em; text-transform: uppercase; padding: 4px 6px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.keep { color: var(--accent); }
+.pill.drop { color: var(--bad); }
+.pill.opt { color: var(--warn); }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+.note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 14px; margin: 14px 0; max-width: 70ch; }
+code { font: 14px var(--mono); background: var(--accent-soft); padding: 1px 5px; }
+ol.steps { padding-left: 22px; margin: 6px 0 14px; } ol.steps li { margin-bottom: 8px; max-width: 70ch; }
+footer { color: var(--muted); font-size: 14px; padding-top: 24px; }
+@media (max-width: 520px) { body { font-size: 16px; } .stat .v { font-size: 26px; } }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="kicker">Two Mac minis 2018 · Intel i3-8100B · 8 GB each · no GPU used</div>
+  <h1>How we made one AI run across two old Macs, and where the time goes now</h1>
+  <p class="lede">Every speed-up we tried on the node1 + node2 cluster, measured the same way, including the ideas that failed. Speeds are words-per-second of text the AI writes (tokens/s), unless a table says otherwise.</p>
+  <div class="stats">
+    <div class="stat"><div class="v"><span class="from">3.3→</span>18.5<small>t/s</small></div><div class="l">gpt-oss-20B, day-one setup vs now (same benchmark)</div></div>
+    <div class="stat"><div class="v"><span class="from">6.7→</span>20.5<small>t/s</small></div><div class="l">DeepSeek-Coder-V2-Lite, day-one setup vs now</div></div>
+    <div class="stat"><div class="v"><span class="from">7.0→</span>12.2<small>t/s</small></div><div class="l">DeepSeek deep into a long chat (8.5k tokens)</div></div>
+    <div class="stat"><div class="v"><span class="from">17→</span>28<small>t/s</small></div><div class="l">DeepSeek while editing code (draft guessing)</div></div>
+  </div>
+</header>
+
+<section id="hardware">
+  <div class="kicker">The machine</div>
+  <h2>What we are working with</h2>
+  <p class="sub">Measured, not taken from spec sheets.</p>
+  <div class="tbl"><table>
+    <tr><th>Part</th><th>Measured</th><th>Why it matters</th></tr>
+    <tr><td>CPU</td><td>4 cores, 3.6 GHz fixed, AVX2 (no AVX-512, no VNNI)</td><td>Every multiply of 4-bit weights has to be unpacked with shuffle instructions.</td></tr>
+    <tr><td>Memory read speed</td><td class="num">20–23 GB/s one core · 29–34 GB/s all cores</td><td>Each word the AI writes reads ~0.8 GB of weights per Mac. This sets the ceiling.</td></tr>
+    <tr><td>Mac-to-Mac link</td><td class="num">1 Gbit/s cable · 49 µs round trip</td><td>The two halves of the model add their results 54 times per word (DeepSeek).</td></tr>
+    <tr><td>Built-in GPU</td><td>Intel UHD 630, shares the same RAM</td><td>Tested: slower than the CPU for this job (2.9 t/s), no extra memory speed.</td></tr>
+    <tr><td>Thunderbolt 3</td><td>2 controllers, 4 ports per Mac, <code>thunderbolt_net</code> driver present</td><td>A direct Mac-to-Mac link at 10–20 Gbit/s, ready to use with one cable.</td></tr>
+  </table></div>
+  <div class="tbl"><table>
+    <tr><th>Speed ceiling per model (both Macs, if only memory mattered)</th><th class="n">weights read per word per Mac</th><th class="n">ceiling</th><th class="n">now</th></tr>
+    <tr><td>Mellum 2 12B (MoE)</td><td class="n">742 MB</td><td class="n">38 t/s</td><td class="n">21–23</td></tr>
+    <tr><td>DeepSeek-Coder-V2-Lite 16B (MoE)</td><td class="n">822 MB</td><td class="n">35 t/s</td><td class="n">20–22</td></tr>
+    <tr><td>gpt-oss 20B (MoE)</td><td class="n">918 MB</td><td class="n">31 t/s</td><td class="n">18–19</td></tr>
+    <tr><td>Qwen2.5-Coder 7B (dense)</td><td class="n">2186 MB</td><td class="n">13 t/s</td><td class="n">9.0</td></tr>
+    <tr><td>Gemma 3 12B (dense)</td><td class="n">3442 MB</td><td class="n">8.3 t/s</td><td class="n">5.3–5.9</td></tr>
+  </table></div>
+</section>
+
+<section id="ladder">
+  <div class="kicker">Step by step</div>
+  <h2>What each change was worth</h2>
+  <p class="sub">Same test every time: a 816-token prompt, then 200 words written with no randomness, 2–3 runs averaged. Each bar adds one change on top of the one above it.</p>
+  <div class="chart"><div class="legend"><span><i style="background:var(--accent)"></i>DeepSeek-Coder-V2-Lite</span><span><i style="background:var(--before)"></i>gpt-oss-20B</span></div><svg id="ladder-chart" role="img" aria-label="Writing speed after each optimization step"></svg><div class="cap">gpt-oss was not measured separately at every step; its bar shows the nearest measured value.</div></div>
+  <div class="tbl"><table>
+    <tr><th>Step</th><th>What changed</th><th class="n">DeepSeek</th><th class="n">gpt-oss</th></tr>
+    <tr><td>1</td><td>Day-one setup: llama.cpp's layer pipeline over the network, power-saving CPU mode, 2 threads</td><td class="n">6.7</td><td class="n">3.3</td></tr>
+    <tr><td>2</td><td>CPU performance mode, 4 threads, direct cable</td><td class="n">11.0</td><td class="n">7.9</td></tr>
+    <tr class="win big"><td>3</td><td>Our tensor-parallel code: both Macs work on every layer at once, each holds half of every weight</td><td class="n">15.8</td><td class="n">15.4</td></tr>
+    <tr><td>4–8</td><td>Huge memory pages, lean AVX2 kernel, low-latency cable settings, 16-bit sync messages, 3 threads on node1</td><td class="n">16.7</td><td class="n">16.0</td></tr>
+    <tr class="win"><td>9</td><td>Network chip power saving (PCIe ASPM) off, found at 64 µs per wake-up</td><td class="n">18.0</td><td class="n">16.8</td></tr>
+    <tr><td>10–11</td><td>node2 keeps its worker threads; sync waits spin instead of sleeping</td><td class="n">18.1</td><td class="n">–</td></tr>
+    <tr><td>19</td><td>New lean AVX2 kernel for 5-bit weights (Q5_0 had none)</td><td class="n">18.3</td><td class="n">–</td></tr>
+    <tr><td>22</td><td>Threads pinned to cores, network interrupts on a spare core</td><td class="n">18.8</td><td class="n">–</td></tr>
+    <tr class="win"><td>26</td><td>New attention kernel (all heads share one pass over the memory)</td><td class="n">20.2</td><td class="n">18.1</td></tr>
+    <tr class="big"><td>29</td><td>Worker threads spin 2× longer between operations (per model)</td><td class="n">20.5</td><td class="n">18.5</td></tr>
+  </table></div>
+  <h3>Reading the prompt</h3>
+  <p>Prompt reading speed went from <span class="num">24</span> to <span class="num">62</span> tokens/s for DeepSeek and from <span class="num">11</span> to <span class="num">53</span> for gpt-oss. The biggest steps were tensor parallel, 16-bit sync messages (half the bytes on the cable), and the new 5-bit kernel (<span class="up">+13%</span>).</p>
+</section>
+
+<section id="budget">
+  <div class="kicker">Bottlenecks</div>
+  <h2>Where one word's 49 ms goes now</h2>
+  <p class="sub">DeepSeek, measured with timers built into our sync code and a per-operation profiler, on node1 (3 compute threads) and node2 (4).</p>
+  <div class="chart"><div class="legend"><span><i style="background:var(--accent)"></i>computing</span><span><i style="background:var(--warn)"></i>waiting in syncs</span><span><i style="background:var(--before)"></i>between words</span></div><svg id="budget-chart" role="img" aria-label="Time per word on each Mac"></svg></div>
+  <div class="tbl"><table>
+    <tr><th>Operation (node2)</th><th>Weight format</th><th class="n">ms per word</th><th class="n">memory speed reached</th></tr>
+    <tr><td>Expert down-projection</td><td>Q5_0</td><td class="n">5.4</td><td class="n">~25 GB/s</td></tr>
+    <tr><td>Expert gate + up</td><td>Q4_K</td><td class="n">10.7</td><td class="n">~22 GB/s</td></tr>
+    <tr><td>Output layer (half the vocabulary)</td><td>Q6_K</td><td class="n">3.2</td><td class="n">26.5 GB/s</td></tr>
+    <tr><td>Shared expert down</td><td>Q8_0</td><td class="n">3.2</td><td class="n">25.2 GB/s</td></tr>
+    <tr><td>Attention projections</td><td>Q4_K</td><td class="n">4.3</td><td class="n">22–23 GB/s</td></tr>
+    <tr><td>Attention itself (short chat)</td><td>f16 cache</td><td class="n">1.3</td><td class="n">grows with chat length</td></tr>
+  </table></div>
+  <h3>Kernels on their own</h3>
+  <p>We timed llama.cpp's matrix kernels directly, outside the model, on the same data from cache (pure arithmetic) and from RAM (3 cores).</p>
+  <div class="tbl"><table>
+    <tr><th>Kernel</th><th class="n">1 core, from cache</th><th class="n">3 cores, from RAM</th></tr>
+    <tr><td>Q4_K (llama.cpp's)</td><td class="n">15.4 GB/s</td><td class="n">24.2 GB/s</td></tr>
+    <tr><td>Q4_0 (our lean kernel)</td><td class="n">19.4 GB/s</td><td class="n">26.2 GB/s</td></tr>
+    <tr><td>Q5_0 (our new kernel)</td><td class="n">20.2 GB/s</td><td class="n">25.4 GB/s</td></tr>
+  </table></div>
+  <div class="note">Every kernel is within ~10% of what the memory can deliver. What's left is the overhead around them (about 1,100 small operations per word, each ending in a thread sync) and the 54 network syncs. Moving more work to node2, using node1's 4th core, reserving huge pages, and a smaller shared-expert format all measured no better, which confirms the memory limit.</div>
+</section>
+
+<section id="attention">
+  <div class="kicker">The long-chat fix</div>
+  <h2>Why chats got slower, and the kernel that fixed it</h2>
+  <p>In DeepSeek, Mellum and gpt-oss, groups of 8 attention heads share one stored row per past word. llama.cpp's CPU code handled each head separately: it read and converted every stored row 8 times, and kept its running total in 16-bit numbers. Our kernel converts each block of rows once, scores all heads together with one register per head, and keeps totals in 32-bit.</p>
+  <div class="chart"><div class="legend"><span><i style="background:var(--accent)"></i>new kernel</span><span><i style="background:var(--before)"></i>llama.cpp's original</span></div><svg id="ctx-chart" role="img" aria-label="Writing speed against chat length"></svg><div class="cap">Writing speed (tokens/s) against how many tokens the chat already holds.</div></div>
+  <div class="tbl"><table>
+    <tr><th>Model</th><th class="n">short chat</th><th class="n">~2k tokens</th><th class="n">~4k</th><th class="n">~8k</th><th class="n">gain at 8k</th></tr>
+    <tr><td>DeepSeek</td><td class="n">21.9 → 22.0</td><td class="n">15.7 → 19.1</td><td class="n">11.4 → 16.3</td><td class="n">7.0 → 12.2</td><td class="n up">+74%</td></tr>
+    <tr><td>Mellum</td><td class="n">21.8 → 23.0</td><td class="n">17.8 → 20.8</td><td class="n">14.4 → 18.6</td><td class="n">10.8 → 17.1</td><td class="n up">+58%</td></tr>
+    <tr><td>gpt-oss (7k)</td><td class="n">18.1 → 18.9</td><td class="n">15.8 → 17.9</td><td class="n">12.4 → 16.6</td><td class="n">7.7 → 14.3</td><td class="n up">+86%</td></tr>
+    <tr><td>Qwen2.5-Coder 7B (7k)</td><td class="n">9.0 → 9.0</td><td class="n">8.5 → 8.8</td><td class="n">7.4 → 8.2</td><td class="n">5.2 → 7.1</td><td class="n up">+37%</td></tr>
+  </table></div>
+  <h3>It was also more accurate</h3>
+  <p>We checked both kernels against exact double-precision math on real model data, 60 checks per model. The biggest error seen:</p>
+  <div class="tbl"><table>
+    <tr><th>Model</th><th class="n">new kernel</th><th class="n">llama.cpp's original</th></tr>
+    <tr><td>DeepSeek</td><td class="n">0.00002</td><td class="n down">0.25</td></tr>
+    <tr><td>Mellum</td><td class="n">0.00003</td><td class="n down">0.32</td></tr>
+    <tr><td>gpt-oss</td><td class="n">0.00002</td><td class="n down">0.08</td></tr>
+    <tr><td>Qwen2.5-Coder 7B / 14B</td><td class="n">0.0007 / 0.000005</td><td class="n down">0.20 / 0.08</td></tr>
+    <tr><td>Gemma 3 12B</td><td class="n">0.00008</td><td class="n down">2.98</td></tr>
+  </table></div>
+</section>
+
+<section id="network">
+  <div class="kicker">Talking between the Macs</div>
+  <h2>The cable, the chip and the syncs</h2>
+  <div class="tbl"><table>
+    <tr><th>Test (one sync: each Mac sends its half, then receives the other)</th><th class="n">time</th></tr>
+    <tr><td>Round trip before, network chip in power saving (ASPM L1)</td><td class="n">145 µs ping · 150 µs sync</td></tr>
+    <tr class="win"><td>ASPM cleared in the chip's PCIe registers (<code>setpci</code>), 1 µs interrupt batching</td><td class="n">49 µs ping · 101 µs sync</td></tr>
+    <tr><td>Same, 8-bit messages (2.2 KB instead of 4.1 KB)</td><td class="n">61 µs (TCP) · 53 µs (UDP)</td></tr>
+    <tr><td>Raw UDP instead of TCP, 4.1 KB / 5.8 KB</td><td class="n">70 / 85 µs (TCP: 81 / 104)</td></tr>
+    <tr><td>Jumbo frames 9000</td><td class="n down">142 µs (worse)</td></tr>
+    <tr><td>Kernel busy-poll sockets</td><td class="n down">123–170 µs (worse)</td></tr>
+  </table></div>
+</section>
+
+<section id="failed">
+  <div class="kicker">What did not work</div>
+  <h2>Ideas we measured and dropped</h2>
+  <div class="tbl"><table>
+    <tr><th>Idea</th><th>Result</th><th></th></tr>
+    <tr><td>Run layers on the built-in GPU (Vulkan)</td><td>2.9 t/s vs 8.6 on CPU: shares RAM, slow drivers</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>OpenVINO split across the Macs</td><td>2.3 t/s: copies weights, runs out of RAM</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>llama.cpp's built-in tensor split over RPC</td><td>2.6 t/s: syncs too often over slow links</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>EAGLE3 draft model for gpt-oss</td><td>8.3 → 6.1 t/s: MoE makes checking guesses expensive</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>More work on node2 (uneven expert split)</td><td>17.9 vs 18.2 (even is best)</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>4 compute threads on node1</td><td>18.05 vs 18.81</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>Merged gate+up expert tensor</td><td>19.7 vs 20.2</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>Reserved huge pages (hugetlbfs)</td><td>node1 could not reserve enough RAM; no gain</td><td><span class="pill opt">option</span></td></tr>
+    <tr><td>8-bit sync messages</td><td>+1.5% writing, +7% prompt, but answers get reworded</td><td><span class="pill opt">option</span></td></tr>
+    <tr><td>Turning off node1's display</td><td>+1–2% memory speed</td><td><span class="pill drop">dropped</span></td></tr>
+    <tr><td>Strip node2 down to a bare kernel</td><td>node2 idles at 0.3% CPU and is the Mac that waits</td><td><span class="pill drop">no gain</span></td></tr>
+    <tr><td>Deeper CPU idle states off (C1/C1E)</td><td>20.27 vs 20.3</td><td><span class="pill drop">dropped</span></td></tr>
+  </table></div>
+</section>
+
+<section id="quality">
+  <div class="kicker">Answers, not just speed</div>
+  <h2>Coding benchmark and fixes that changed answers</h2>
+  <div class="tbl"><table>
+    <tr><th>Model</th><th class="n">write code (40)</th><th class="n">fix bugs with tools (10)</th><th class="n">sec per problem</th><th class="n">t/s</th></tr>
+    <tr><td>DeepSeek-Coder-V2-Lite</td><td class="n">82%</td><td class="n">70%</td><td class="n">19 / 13</td><td class="n">20.1</td></tr>
+    <tr><td>Mellum 2 12B Thinking</td><td class="n">85%</td><td class="n">80%</td><td class="n">61 / 149</td><td class="n">19.7</td></tr>
+    <tr><td>Mellum 2 12B Instruct</td><td class="n">88%</td><td class="n">40%</td><td class="n">32 / 28</td><td class="n">20.6</td></tr>
+    <tr><td>gpt-oss 20B (low reasoning)</td><td class="n">80%</td><td class="n">80%</td><td class="n">29 / 88</td><td class="n">14.4</td></tr>
+    <tr><td>Qwen2.5-Coder 14B</td><td class="n">80%</td><td class="n">100%</td><td class="n">69 / 87</td><td class="n">4.5</td></tr>
+    <tr><td>Qwen2.5-Coder 7B</td><td class="n">85%</td><td class="n">60%</td><td class="n">27 / 46</td><td class="n">8.9</td></tr>
+  </table></div>
+  <ol class="steps">
+    <li><b>DeepSeek could not use tools.</b> Its chat template has none, so the server dropped them and the model invented outputs. A custom template fixed it; it now runs code and reports real results.</li>
+    <li><b>Mellum Thinking looped</b> ("We should also mention…") until it ran out of room. Its own recommended settings plus a thinking cap stopped it.</li>
+    <li><b>Draft guessing</b> from text already in the chat: code edits 17 → 28 t/s (DeepSeek), 16 → 27 (gpt-oss); tuned so summaries lose only 2%.</li>
+    <li><b>Long chats re-read everything</b> after small changes (12,700 tokens, 4 minutes). Full-size sliding-window memory fixed it: 0.4 s.</li>
+  </ol>
+</section>
+
+<section id="next">
+  <div class="kicker">Next</div>
+  <h2>Faster links and more Macs</h2>
+  <p>The kernels are close to the memory limit, so the next real gains come from the link between Macs.</p>
+  <ol class="steps">
+    <li><b>One Thunderbolt 3 or 4 cable between node1 and node2.</b> Linux networking over Thunderbolt runs at 10–20 Gbit/s instead of 1. It is prepared: <code>tb-link.sh up</code> brings the link up and <code>start-ep.sh</code> uses it automatically. Expected: syncs cost less than half, prompt reading +10–15%.</li>
+    <li><b>A third and fourth Mac.</b> Each Mac mini has 4 Thunderbolt ports, so four Macs can be wired directly to each other with no switch. Splitting every weight four ways halves each Mac's reading work (DeepSeek: ~410 MB per word each). Our sync code is written for 2 Macs today; it needs a 4-way version, which can be tested properly once the Macs arrive.</li>
+    <li><b>For a classroom,</b> pairs of Macs each serving their own users give more total answers per minute than one big group.</li>
+  </ol>
+</section>
+
+<footer>node1 + node2 · llama.cpp with our tensor-parallel layer (<code>llama-ep</code>), new AVX2 kernels for Q5_0 and grouped attention · all numbers measured on this cluster, September 2026.</footer>
+</div>
+
+<script>
+(function () {
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text !== undefined) e.textContent = text; return e; };
+
+  function ladder() {
+    const rows = [["1 day one", 6.7, 3.3], ["2 tuned pipeline", 11.0, 7.9], ["3 tensor parallel", 15.8, 15.4], ["4–8 kernel, cable, fp16", 16.7, 16.0],
+                  ["9 ASPM off", 18.0, 16.8], ["19 Q5_0 kernel", 18.3, 16.8], ["22 pinning", 18.8, 16.8], ["26 attention kernel", 20.2, 18.1], ["29 polling", 20.5, 18.5]];
+    const svg = document.getElementById("ladder-chart"), W = 860, rowH = 34, L = 170, R = 60, top = 8, H = top + rows.length * rowH + 26, max = 24;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    const x = v => L + (W - L - R) * v / max;
+    for (let t = 0; t <= max; t += 4) {
+      svg.append(el("line", { x1: x(t), x2: x(t), y1: top, y2: H - 22, stroke: css("--line"), "stroke-width": 1 }));
+      svg.append(el("text", { x: x(t), y: H - 6, "text-anchor": "middle", "font-size": 12, fill: css("--muted"), "font-family": "JetBrains Mono, monospace" }, t));
+    }
+    rows.forEach((r, i) => {
+      const y = top + i * rowH;
+      svg.append(el("text", { x: 0, y: y + 20, "font-size": 13.5, fill: css("--ink"), "font-family": "Source Sans 3, sans-serif" }, r[0]));
+      svg.append(el("rect", { x: L, y: y + 5, width: x(r[1]) - L, height: 12, fill: css("--accent") }));
+      svg.append(el("rect", { x: L, y: y + 19, width: x(r[2]) - L, height: 9, fill: css("--before") }));
+      svg.append(el("text", { x: x(r[1]) + 6, y: y + 15, "font-size": 12.5, fill: css("--ink"), "font-family": "JetBrains Mono, monospace", "font-weight": 600 }, r[1].toFixed(1)));
+      svg.append(el("text", { x: x(r[2]) + 6, y: y + 28, "font-size": 11.5, fill: css("--muted"), "font-family": "JetBrains Mono, monospace" }, r[2].toFixed(1)));
+    });
+  }
+
+  function budget() {
+    const rows = [["node1 (3 threads)", 42.6, 5.7, 1.4], ["node2 (4 threads)", 39.1, 9.2, 1.6]];
+    const svg = document.getElementById("budget-chart"), W = 860, L = 140, R = 20, rowH = 44, H = rows.length * rowH + 34, max = 52;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    const x = v => L + (W - L - R) * v / max;
+    for (let t = 0; t <= max; t += 10) {
+      svg.append(el("line", { x1: x(t), x2: x(t), y1: 0, y2: H - 22, stroke: css("--line") }));
+      svg.append(el("text", { x: x(t), y: H - 6, "text-anchor": "middle", "font-size": 12, fill: css("--muted"), "font-family": "JetBrains Mono, monospace" }, t + " ms"));
+    }
+    rows.forEach((r, i) => {
+      const y = 6 + i * rowH; let at = 0;
+      svg.append(el("text", { x: 0, y: y + 21, "font-size": 13.5, fill: css("--ink"), "font-family": "Source Sans 3, sans-serif" }, r[0]));
+      [[r[1], "--accent"], [r[2], "--warn"], [r[3], "--before"]].forEach(([v, c]) => {
+        svg.append(el("rect", { x: x(at), y: y + 6, width: x(at + v) - x(at), height: 22, fill: css(c) }));
+        if (v > 4) svg.append(el("text", { x: x(at) + 6, y: y + 21.5, "font-size": 12, fill: css("--bg"), "font-family": "JetBrains Mono, monospace", "font-weight": 600 }, v.toFixed(1)));
+        at += v;
+      });
+    });
+  }
+
+  function ctx() {
+    const series = [
+      ["DeepSeek", [[87, 21.9], [1891, 15.7], [4216, 11.4], [8538, 7.0]], [[87, 22.0], [1891, 19.1], [4216, 16.3], [8538, 12.2]]],
+      ["Mellum", [[85, 21.8], [1981, 17.8], [4326, 14.4], [8609, 10.8]], [[85, 23.0], [1981, 20.8], [4326, 18.6], [8609, 17.1]]],
+      ["gpt-oss", [[79, 18.1], [1686, 15.8], [3595, 12.4], [7095, 7.7]], [[79, 18.9], [1686, 17.9], [3595, 16.6], [7095, 14.3]]]];
+    const svg = document.getElementById("ctx-chart"), W = 860, H = 330, L = 44, R = 90, T = 12, B = 34, xmax = 9000, ymax = 24;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    const x = v => L + (W - L - R) * v / xmax, y = v => T + (H - T - B) * (1 - v / ymax);
+    for (let t = 0; t <= ymax; t += 4) {
+      svg.append(el("line", { x1: L, x2: W - R, y1: y(t), y2: y(t), stroke: css("--line") }));
+      svg.append(el("text", { x: L - 8, y: y(t) + 4, "text-anchor": "end", "font-size": 12, fill: css("--muted"), "font-family": "JetBrains Mono, monospace" }, t));
+    }
+    for (let t = 0; t <= 8000; t += 2000) svg.append(el("text", { x: x(t), y: H - 10, "text-anchor": "middle", "font-size": 12, fill: css("--muted"), "font-family": "JetBrains Mono, monospace" }, t === 0 ? "0" : (t / 1000) + "k tokens"));
+    const line = (pts, color, dash, w) => svg.append(el("polyline", { points: pts.map(p => x(p[0]) + "," + y(p[1])).join(" "), fill: "none", stroke: color, "stroke-width": w, "stroke-dasharray": dash || "none" }));
+    series.forEach(([name, before, after]) => {
+      line(before, css("--before"), "5 4", 2);
+      line(after, css("--accent"), "", 2.5);
+      after.forEach(p => svg.append(el("circle", { cx: x(p[0]), cy: y(p[1]), r: 3.2, fill: css("--accent") })));
+      const e = after[after.length - 1];
+      svg.append(el("text", { x: x(e[0]) + 8, y: y(e[1]) + 4, "font-size": 12.5, fill: css("--ink"), "font-family": "Source Sans 3, sans-serif", "font-weight": 600 }, name));
+    });
+  }
+
+  function draw() { ["ladder-chart", "budget-chart", "ctx-chart"].forEach(id => document.getElementById(id).replaceChildren()); ladder(); budget(); ctx(); }
+  draw();
+  if (window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+})();
+</script>

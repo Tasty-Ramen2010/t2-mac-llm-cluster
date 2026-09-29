@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cluster Assistant</title>
+<link rel="stylesheet" href="/static/katex.min.css">
+<link rel="stylesheet" href="/static/hl-light.css" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="/static/hl-dark.css" media="(prefers-color-scheme: dark)">
+<style>
+  :root { --bg:#f6f5f2; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#e3e1db; --accent:#2f5d50; --tool:#f0efe9; --code:#f3f2ee; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#171716; --fg:#ecebe6; --muted:#9a9a93; --card:#21211f; --line:#33332f; --accent:#7fb8a4; --tool:#2a2a27; --code:#1b1b1a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 system-ui, -apple-system, "Segoe UI", "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"; }
+  main { max-width:780px; margin:0 auto; padding:16px 16px 0; display:flex; flex-direction:column; min-height:100vh; min-height:100dvh; }
+  h1 { font-size:17px; margin:4px 0 2px; } .sub { color:var(--muted); font-size:13px; margin:0 0 12px; }
+  #log { flex:1; display:flex; flex-direction:column; gap:10px; padding-bottom:16px; }
+  .msg { padding:10px 14px; border-radius:10px; overflow-wrap:anywhere; }
+  .user { background:var(--accent); color:#fff; align-self:flex-end; max-width:85%; white-space:pre-wrap; }
+  .bot { background:var(--card); border:1px solid var(--line); }
+  .bot > :first-child { margin-top:0; } .bot > :last-child { margin-bottom:0; }
+  .bot h1, .bot h2, .bot h3 { line-height:1.3; margin:14px 0 6px; } .bot h1 { font-size:20px; } .bot h2 { font-size:17px; } .bot h3 { font-size:15px; }
+  .bot p { margin:8px 0; } .bot ul, .bot ol { margin:8px 0; padding-left:24px; }
+  .bot a { color:var(--accent); }
+  .bot blockquote { margin:8px 0; padding:2px 12px; border-left:3px solid var(--line); color:var(--muted); }
+  .bot code { font:13px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace; background:var(--code); padding:1px 5px; border-radius:4px; }
+  .bot pre { background:var(--code); border:1px solid var(--line); border-radius:8px; padding:10px 12px; overflow-x:auto; }
+  .bot pre code { background:none; padding:0; }
+  .bot pre code.hljs { background:none; padding:0; }
+  .table-wrap { overflow-x:auto; margin:8px 0; }
+  .bot table { border-collapse:collapse; font-size:14px; }
+  .bot th, .bot td { border:1px solid var(--line); padding:5px 10px; text-align:left; vertical-align:top; }
+  .bot th { background:var(--tool); }
+  .bot hr { border:0; border-top:1px solid var(--line); margin:12px 0; }
+  .bot img { max-width:100%; }
+  .katex-display { overflow-x:auto; overflow-y:hidden; padding:4px 0; }
+  .mermaid { background:var(--card); text-align:center; overflow-x:auto; margin:8px 0; }
+  details.tool { background:var(--tool); border-radius:8px; padding:6px 10px; font-size:13px; color:var(--muted); }
+  details.tool pre { white-space:pre-wrap; max-height:240px; overflow:auto; margin:6px 0 0; color:var(--fg); font:12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+  form { position:sticky; bottom:0; padding:6px 0 calc(12px + env(safe-area-inset-bottom)); background:var(--bg); border-top:1px solid var(--line); }
+  .row { display:flex; gap:8px; }
+  #live { color:var(--muted); font-size:13px; min-height:18px; margin:0 2px 6px; font-variant-numeric:tabular-nums; }
+  #live:empty::before { content:"ready"; opacity:.6; }
+  textarea { flex:1; resize:none; padding:10px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); font:inherit; }
+  button { padding:0 16px; border:0; border-radius:10px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .status { color:var(--muted); font-size:13px; }
+  .stats { color:var(--muted); font-size:12px; margin:-4px 2px 0; }
+  .cursor::after { content:"▍"; color:var(--accent); animation:blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Cluster Assistant</h1>
+  <p class="sub"><span id="model">…</span> on node1 + node2 · can search the web, read pages, run commands and Python (sandboxed)</p>
+  <div id="log"></div>
+  <form id="f">
+    <div id="live"></div>
+    <div class="row">
+      <textarea id="q" rows="2" placeholder="Ask something…" autofocus></textarea>
+      <button id="b">Send</button>
+    </div>
+  </form>
+</main>
+<script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
+<script src="/static/katex.min.js"></script>
+<script src="/static/highlight.min.js"></script>
+<script src="/static/mermaid.min.js"></script>
+<script>
+function reportError(what) {
+  try { navigator.sendBeacon("/api/clientlog", JSON.stringify({ what: String(what).slice(0, 2000), ua: navigator.userAgent })); } catch {}
+}
+addEventListener("error", (e) => reportError(`${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`));
+addEventListener("unhandledrejection", (e) => reportError("unhandled: " + (e.reason?.stack || e.reason)));
+async function showModel() {   // the loaded model can change (benchmarks, presets); keep the subtitle honest
+  try { const m = await (await fetch("/api/model", { cache: "no-store" })).json(); document.getElementById("model").textContent = m.up ? m.name : "AI offline"; } catch {}
+}
+showModel(); setInterval(showModel, 15000);
+const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: dark ? "dark" : "default" });
+marked.use({ gfm: true, breaks: true });
+DOMPurify.addHook("afterSanitizeAttributes", (n) => {
+  if (n.tagName === "A") { n.setAttribute("target", "_blank"); n.setAttribute("rel", "noopener noreferrer"); }
+});
+
+function esc(s) { return s.replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function render(md) {
+  const code = [], math = [];
+  // 1. Protect code so '$' or '\(' inside code is never treated as math.
+  let t = md.replace(/```[\s\S]*?(?:```|$)/g, (m) => `\u0000C${code.push(m) - 1}\u0000`)
+            .replace(/`[^`\n]+`/g, (m) => `\u0000C${code.push(m) - 1}\u0000`);
+  // 2. Pull out math before Markdown can turn _ and * inside it into italics.
+  const put = (tex, display) => `MATHPH${math.push({ tex, display }) - 1}X`;
+  t = t.replace(/\$\$([\s\S]+?)\$\$/g, (_, x) => put(x, true))
+       .replace(/\\\[([\s\S]+?)\\\]/g, (_, x) => put(x, true))
+       .replace(/\\\(([\s\S]+?)\\\)/g, (_, x) => put(x, false))
+       .replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (m, x) => (/^[\d.,\s\-–]+$/.test(x) ? m : put(x, false)));
+  // 3. Restore code, render Markdown, sanitize (answers can contain text from arbitrary web pages).
+  t = t.replace(/\u0000C(\d+)\u0000/g, (_, i) => code[+i]);
+  let html = DOMPurify.sanitize(marked.parse(t));
+  // 4. Put rendered math back (KaTeX escapes its own input).
+  html = html.replace(/MATHPH(\d+)X/g, (_, i) => {
+    const m = math[+i];
+    try { return katex.renderToString(m.tex, { displayMode: m.display, throwOnError: false }); }
+    catch { return esc(m.tex); }
+  });
+  return html;
+}
+
+// Models often write labels like A[Compute sqrt(D)] that Mermaid rejects; quoting labels fixes most of them.
+let mmdCount = 0;
+function quoteNode(seg) {
+  const m = seg.match(/^(\s*[\w.-]+)(\[\[|\[\(|\(\(|\(\[|\{\{|\[\/|\[\\|\[|\(|\{|>)([\s\S]*)(\]\]|\)\]|\)\)|\]\)|\}\}|\/\]|\\\]|\]|\)|\})(\s*(?::::\w+)?\s*;?\s*)$/);
+  if (!m) return seg;
+  const [, id, open, label, close, rest] = m;
+  if (/^\s*".*"\s*$/.test(label)) return seg;
+  return `${id}${open}"${label.replace(/"/g, "#quot;")}"${close}${rest}`;
+}
+function fixMermaid(src) {
+  const edge = /(\s*(?:--\s[^-][^>]*?-->|-\.\s[^.]*?\.->|==\s[^=]*?==>|-->|---|-\.->|==>|--x|--o)(?:\|[^|]*\|)?\s*)/;
+  return src.split("\n").map((line) =>
+    /^\s*(graph|flowchart|subgraph|end\b|classDef|class\s|style|linkStyle|click|%%|direction)/.test(line) ? line
+      : line.split(edge).map((seg, i) => (i % 2 ? seg : quoteNode(seg))).join("")
+  ).join("\n");
+}
+
+async function decorate(el) {
+  el.querySelectorAll("table").forEach((tb) => { const w = document.createElement("div"); w.className = "table-wrap"; tb.replaceWith(w); w.appendChild(tb); });
+  const diagrams = [];
+  el.querySelectorAll("pre > code.language-mermaid").forEach((c) => {
+    const d = document.createElement("div"); d.className = "mermaid"; d.textContent = c.textContent;
+    c.parentElement.replaceWith(d); diagrams.push(d);
+  });
+  el.querySelectorAll("pre code").forEach((c) => hljs.highlightElement(c));
+  for (const d of diagrams) {
+    const src = d.textContent;
+    let good = null;
+    for (const cand of [src, fixMermaid(src)]) {
+      try { if (await mermaid.parse(cand, { suppressErrors: true })) { good = cand; break; } } catch {}
+    }
+    try {
+      if (!good) throw new Error("invalid diagram");
+      const { svg } = await mermaid.render("mmd" + (++mmdCount), good);
+      d.innerHTML = svg;
+    } catch {
+      const pre = document.createElement("pre"); pre.textContent = src; d.replaceWith(pre);
+    }
+  }
+}
+
+const log = document.getElementById("log"), q = document.getElementById("q"), b = document.getElementById("b");
+const history = [];
+function addUser(text) { const d = document.createElement("div"); d.className = "msg user"; d.textContent = text; log.appendChild(d); }
+async function addBot(md) {
+  const d = document.createElement("div"); d.className = "msg bot"; d.innerHTML = render(md);
+  log.appendChild(d); await decorate(d); scrollTo(0, document.documentElement.scrollHeight);
+}
+function addTool(ev) {
+  const d = document.createElement("details"); d.className = "tool";
+  const s = document.createElement("summary");
+  s.textContent = `🔧 ${ev.tool}: ${ev.args.command || ev.args.query || ev.args.url || ""} (${ev.seconds}s)`;
+  const p = document.createElement("pre"); p.textContent = ev.result;
+  d.append(s, p); log.appendChild(d);
+}
+// follow the answer while the reader is at the bottom; scrolling up stops following until they come back down
+const live = document.getElementById("live");
+const docH = () => document.documentElement.scrollHeight;
+const atBottom = () => innerHeight + scrollY >= docH() - 80;
+let follow = true;
+addEventListener("scroll", () => { follow = atBottom(); }, { passive: true });
+const toBottom = () => { if (follow) scrollTo(0, docH()); };
+function addStats(text) { const d = document.createElement("div"); d.className = "stats"; d.textContent = text; log.appendChild(d); }
+
+document.getElementById("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = q.value.trim(); if (!text) return;
+  q.value = ""; b.disabled = true;
+  addUser(text); history.push({ role: "user", content: text });
+  follow = true; toBottom();
+  const t0 = Date.now();
+  let phase = "waiting", tool = "", nTok = 0, tFirst = 0, bubble = null, md = "", pending = false, stats = null, totalTok = 0;
+  const stamps = [];                           // arrival times of recent tokens -> rolling rate over the last ~2 s
+  const rollingRate = () => {
+    const now = Date.now();
+    while (stamps.length && now - stamps[0] > 2000) stamps.shift();
+    if (stamps.length < 3) return 0;
+    return (stamps.length - 1) / ((stamps[stamps.length - 1] - stamps[0]) / 1000);
+  };
+  const showStatus = () => {
+    const secs = ((Date.now() - t0) / 1000).toFixed(0), r = rollingRate();
+    live.textContent = phase === "tool" ? `🔧 running ${tool}… ${secs}s`
+      : phase === "waiting" ? `⏳ reading your message… ${secs}s`
+      : `${phase === "thinking" ? "💭 thinking" : "✍️ writing"} · ${r ? r.toFixed(1) : "–"} tokens/s · ${nTok} tokens · ${secs}s`;
+  };
+  const tick = setInterval(showStatus, 200);
+  const paint = () => {                       // re-render the growing answer at most once per frame
+    if (pending) return; pending = true;
+    requestAnimationFrame(() => { pending = false; if (bubble) { bubble.innerHTML = render(md); toBottom(); } });
+  };
+  const finishBubble = async () => {
+    if (!bubble) return;
+    const el = bubble; bubble = null;
+    el.classList.remove("cursor");
+    try { el.innerHTML = render(md); await decorate(el); } catch (err) { reportError("render: " + (err?.stack || err)); }
+    toBottom();
+  };
+  let answered = false;
+  const remember = (answer) => { if (!answered && answer) { history.push({ role: "assistant", content: answer }); answered = true; } };
+  const onEvent = async (ev) => {
+    if (ev.type === "thinking" || ev.type === "token") {
+      if (!tFirst) tFirst = Date.now();
+      nTok++; stamps.push(Date.now());
+      if (ev.type === "thinking") { if (phase !== "writing") phase = "thinking"; return; }
+      phase = "writing";
+      if (!bubble) { bubble = document.createElement("div"); bubble.className = "msg bot cursor"; log.appendChild(bubble); md = ""; }
+      md += ev.text; paint();
+    } else if (ev.type === "stats") {
+      stats = ev; totalTok += ev.tokens;
+    } else if (ev.type === "tool_start") {
+      await finishBubble(); phase = "tool"; tool = `${ev.tool}: ${ev.args.command || ev.args.query || ev.args.url || ""}`;
+    } else if (ev.type === "tool") {
+      addTool(ev); toBottom(); phase = "waiting"; nTok = 0; tFirst = 0; stamps.length = 0;
+    } else if (ev.type === "done") {
+      remember(ev.answer || md);
+      if (!bubble && ev.answer) { bubble = document.createElement("div"); bubble.className = "msg bot"; log.appendChild(bubble); md = ev.answer; }
+      await finishBubble();
+      if (stats) addStats(`⚡ ${stats.tps} tokens/s · ${totalTok} tokens · read ${stats.prompt_tokens} new prompt tokens at ${stats.prompt_tps}/s · ${((Date.now() - t0) / 1000).toFixed(1)}s total`);
+      toBottom();
+    } else if (ev.type === "error") {
+      await finishBubble(); await addBot("**Error:** " + ev.error);
+    }
+  };
+  // The server runs the question as a job; if the phone drops the connection (Safari "Load failed", app switch,
+  // screen lock) we reconnect and continue from the last event we got, so nothing is lost or repeated.
+  let seen = 0, finished = false, lastErr = null;
+  const deadline = Date.now() + 10 * 60 * 1000;
+  try {
+    const sr = await fetch("/api/chat_start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: history }) });
+    const { id } = await sr.json();
+    while (!finished && Date.now() < deadline) {
+      try {
+        const r = await fetch(`/api/chat_events?id=${id}&from=${seen}`, { cache: "no-store" });
+        if (r.status === 404) throw new Error("the server lost this question (was it restarted?)");
+        const reader = r.body.getReader(), dec = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, i); buf = buf.slice(i + 1);
+            if (!line.trim()) continue;
+            const ev = JSON.parse(line);
+            if (ev.type === "ping") continue;
+            seen++;
+            if (ev.type === "done" || ev.type === "error") finished = true;
+            await onEvent(ev);
+          }
+        }
+      } catch (err) {
+        if (String(err).includes("lost this question")) throw err;
+        lastErr = err; reportError("reconnecting after: " + err);
+        live.textContent = "📶 connection dropped, reconnecting…";
+        await new Promise((res) => {                     // retry soon, or right away when the tab is visible again
+          const t = setTimeout(res, 1500);
+          document.addEventListener("visibilitychange", () => { if (!document.hidden) { clearTimeout(t); res(); } }, { once: true });
+        });
+      }
+    }
+    if (!finished) throw lastErr || new Error("gave up after 10 minutes");
+  } catch (err) { reportError("stream: " + (err?.stack || err)); await finishBubble(); await addBot("**Error:** " + esc(String(err))); }
+  if (!answered) {
+    if (md.trim()) remember(md);
+    else if (history.at(-1)?.role === "user") history.pop();
+  }
+  clearInterval(tick); live.textContent = ""; b.disabled = false; q.focus();
+  toBottom();
+});
+const DEMO = `# Rendering test
+**Bold**, *italics*, ***both***, ~~strikethrough~~, \`inline code\`, and a [link](https://example.com).
+
+| Symbol | Name | Value |
+|---|---|---|
+| π | pi | ≈ 3.14159 |
+| µ | micro | 10⁻⁶ |
+| → ∑ ∞ ≤ ≥ ≠ | arrows & math | ✓ |
+
+Inline math: $E = mc^2$ and $\\frac{a_1}{b_2}$. Prices stay prices: $5 and $10.
+
+$$\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}$$
+
+> A quote with emoji 🧬🔬 and accents: café, niño, 中文, Ελληνικά.
+
+\`\`\`python
+def is_prime(n):  # costs $0
+    return n > 1 and all(n % d for d in range(2, int(n**0.5) + 1))
+\`\`\`
+
+\`\`\`mermaid
+flowchart LR
+  A[Peptide] --> B(RAPiDock poses)
+  B --> C{Score}
+  C -->|best| D[Ranked results]
+\`\`\`
+
+1. First item
+2. Second item with **bold**`;
+addEventListener("DOMContentLoaded", () => {
+  if (location.hash === "#demo") addBot(DEMO);
+  else if (location.hash.startsWith("#md:")) addBot(new TextDecoder().decode(Uint8Array.from(atob(decodeURIComponent(location.hash.slice(4))), (c) => c.charCodeAt(0))));
+});
+q.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.getElementById("f").requestSubmit(); } });
+</script>
+</body>
+</html>

@@ -1,0 +1,1067 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cluster AI</title>
+<link rel="stylesheet" href="/static/katex.min.css">
+<link rel="stylesheet" href="/static/hl-light.css" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="/static/hl-dark.css" media="(prefers-color-scheme: dark)">
+<style>
+:root {
+  --bg: #ffffff; --side: #f7f7f8; --card: #ffffff; --soft: #f3f3f4; --line: #e6e6e8; --fg: #16161a; --muted: #6b6b76;
+  --accent: #2563eb; --accent-soft: #e8efff; --good: #15803d; --good-soft: #e7f6ec; --bad: #c2410c; --bad-soft: #fdeee6;
+  --warn: #b45309; --code: #f6f6f7; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) { :root {
+  --bg: #19191b; --side: #131315; --card: #1f1f22; --soft: #26262a; --line: #2f2f34; --fg: #ececf0; --muted: #9a9aa5;
+  --accent: #6d9bff; --accent-soft: #1e2a45; --good: #4ade80; --good-soft: #15291d; --bad: #fb923c; --bad-soft: #33211a;
+  --warn: #fbbf24; --code: #151517; --shadow: none;
+} }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"; }
+button { font: inherit; color: inherit; }
+.app { display: flex; height: 100vh; height: 100dvh; }
+
+/* ---------- sidebar ---------- */
+aside { width: 264px; flex: none; background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 16px 16px 10px; font-weight: 650; font-size: 16px; }
+.logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #22d3ee, #8b5cf6); display: grid; place-items: center; color: #fff; font-size: 14px; }
+.newchat { margin: 4px 12px 8px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); cursor: pointer; text-align: left; display: flex; gap: 8px; align-items: center; box-shadow: var(--shadow); }
+.newchat:hover { border-color: var(--accent); }
+.chats { flex: 1; overflow-y: auto; padding: 4px 8px; }
+.chats .label { font-size: 11.5px; color: var(--muted); padding: 10px 8px 4px; text-transform: uppercase; letter-spacing: .04em; }
+.chatitem { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 8px; cursor: pointer; color: var(--fg); font-size: 14px; }
+.chatitem span { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.chatitem:hover, .chatitem.on { background: var(--soft); }
+.chatitem .del { visibility: hidden; border: 0; background: none; cursor: pointer; color: var(--muted); padding: 0 2px; }
+.chatitem:hover .del { visibility: visible; }
+nav { border-top: 1px solid var(--line); padding: 8px; display: grid; gap: 2px; }
+nav a { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; color: var(--fg); text-decoration: none; font-size: 14px; }
+nav a:hover { background: var(--soft); } nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.sidefoot { padding: 10px 14px 14px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+.dot.ok { background: #22c55e; } .dot.busy { background: #f59e0b; } .dot.off { background: #ef4444; }
+
+/* ---------- main ---------- */
+main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+header { height: 56px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 20px; border-bottom: 1px solid var(--line); }
+header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+.menu { display: none; border: 0; background: none; font-size: 20px; cursor: pointer; }
+.spacer { flex: 1; }
+.modelbtn { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 6px 12px; cursor: pointer; font-size: 14px; box-shadow: var(--shadow); }
+.modelbtn:hover { border-color: var(--accent); }
+.modelbtn small { color: var(--muted); }
+.view { flex: 1; min-height: 0; display: none; }
+.view.on { display: flex; flex-direction: column; }
+
+/* ---------- chat ---------- */
+#scroll { flex: 1; overflow-y: auto; }
+.thread { max-width: 780px; margin: 0 auto; padding: 24px 20px 12px; }
+.msg { margin: 0 0 22px; }
+.msg.user { display: flex; justify-content: flex-end; }
+.msg.user .bubble { background: var(--soft); border-radius: 18px; padding: 10px 16px; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.who { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.who .logo { width: 22px; height: 22px; font-size: 11px; border-radius: 6px; }
+.md { overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3 { line-height: 1.3; margin: 18px 0 8px; } .md h1 { font-size: 21px; } .md h2 { font-size: 18px; } .md h3 { font-size: 16px; }
+.md p { margin: 10px 0; } .md ul, .md ol { margin: 10px 0; padding-left: 26px; } .md li { margin: 3px 0; }
+.md a { color: var(--accent); }
+.md blockquote { margin: 10px 0; padding: 2px 14px; border-left: 3px solid var(--line); color: var(--muted); }
+.md code { font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; background: var(--soft); padding: 1.5px 5px; border-radius: 5px; }
+.codebox { border: 1px solid var(--line); border-radius: 10px; margin: 12px 0; overflow: hidden; background: var(--code); }
+.codehead { display: flex; justify-content: space-between; align-items: center; padding: 5px 10px 5px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); }
+.codehead button, .actions button { border: 0; background: none; cursor: pointer; color: var(--muted); font-size: 12px; padding: 3px 7px; border-radius: 6px; }
+.codehead button:hover, .actions button:hover { background: var(--soft); color: var(--fg); }
+.md pre { margin: 0; padding: 12px 14px; overflow-x: auto; background: none; }
+.md pre code, .md pre code.hljs { background: none; padding: 0; }
+.table-wrap { overflow-x: auto; margin: 10px 0; }
+.md table { border-collapse: collapse; font-size: 14px; } .md th, .md td { border: 1px solid var(--line); padding: 6px 11px; text-align: left; vertical-align: top; }
+.md th { background: var(--soft); } .md hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; } .md img { max-width: 100%; }
+.katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+.mermaid { text-align: center; overflow-x: auto; margin: 10px 0; }
+details.think, details.tool { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0 12px; background: var(--card); }
+details.think summary, details.tool summary { cursor: pointer; padding: 7px 12px; font-size: 13px; color: var(--muted); list-style: none; display: flex; gap: 8px; align-items: center; }
+details.think summary::-webkit-details-marker, details.tool summary::-webkit-details-marker { display: none; }
+details.think summary::before, details.tool summary::before { content: "›"; display: inline-block; transition: transform .15s; font-size: 16px; }
+details[open].think summary::before, details[open].tool summary::before { transform: rotate(90deg); }
+.thinktext { padding: 2px 14px 10px; font-size: 13.5px; color: var(--muted); white-space: pre-wrap; max-height: 320px; overflow-y: auto; }
+.tool pre { margin: 0; padding: 8px 14px 12px; font: 12.5px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; max-height: 280px; overflow: auto; color: var(--fg); }
+.toolcode { border-top: 1px dashed var(--line); }
+.stats { font-size: 12.5px; color: var(--muted); margin-top: 8px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.stats b { color: var(--fg); font-weight: 600; }
+.actions { display: inline-flex; gap: 2px; }
+.cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; } @keyframes blink { 50% { opacity: 0; } }
+.welcome { max-width: 780px; margin: 9vh auto 0; padding: 0 20px; text-align: center; }
+.welcome h2 { font-size: 26px; margin: 14px 0 6px; } .welcome p { color: var(--muted); margin: 0 0 22px; }
+.welcome .logo { width: 48px; height: 48px; font-size: 22px; border-radius: 14px; margin: 0 auto; }
+.chips { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; text-align: left; }
+.chips button { border: 1px solid var(--line); background: var(--card); border-radius: 12px; padding: 12px 14px; cursor: pointer; font-size: 14px; box-shadow: var(--shadow); }
+.chips button:hover { border-color: var(--accent); } .chips button small { display: block; color: var(--muted); font-size: 12.5px; }
+.composer { flex: none; padding: 6px 20px calc(16px + env(safe-area-inset-bottom)); }
+.composer .inner { max-width: 780px; margin: 0 auto; }
+#live { font-size: 12.5px; color: var(--muted); min-height: 20px; padding: 0 6px 4px; font-variant-numeric: tabular-nums; }
+.box { display: flex; align-items: flex-end; gap: 8px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); padding: 8px 8px 8px 16px; box-shadow: var(--shadow); }
+.box:focus-within { border-color: var(--accent); }
+.box textarea { flex: 1; border: 0; outline: 0; resize: none; background: none; color: var(--fg); font: inherit; max-height: 220px; padding: 6px 0; }
+.send { width: 36px; height: 36px; flex: none; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; display: grid; place-items: center; font-size: 17px; }
+.send:disabled { opacity: .35; cursor: default; } .send.stop { background: var(--fg); color: var(--bg); }
+.ctx { font-size: 12px; color: var(--muted); white-space: nowrap; padding: 0 6px 4px; font-variant-numeric: tabular-nums; }
+.ctx b.warn { color: var(--warn); } .ctx b.bad { color: var(--bad); }
+.health { font-size: 11.5px; margin-top: 6px; line-height: 1.5; } .health .w { color: var(--bad); font-weight: 600; }
+.hint { text-align: center; font-size: 11.5px; color: var(--muted); padding-top: 6px; }
+
+/* ---------- dashboard ---------- */
+.page { flex: 1; overflow-y: auto; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 20px; }
+.grid { display: grid; gap: 14px; }
+.g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); } .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; box-shadow: var(--shadow); min-width: 0; }
+.card h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.big { font-size: 30px; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.big small { font-size: 14px; color: var(--muted); font-weight: 500; letter-spacing: 0; }
+.sub { font-size: 13px; color: var(--muted); }
+.row { display: flex; justify-content: space-between; gap: 10px; font-size: 13.5px; padding: 3px 0; font-variant-numeric: tabular-nums; }
+.row span:first-child { color: var(--muted); }
+.bar { height: 7px; border-radius: 4px; background: var(--soft); overflow: hidden; margin: 3px 0 7px; }
+.bar i { display: block; height: 100%; border-radius: 4px; background: var(--accent); transition: width .4s; }
+.cores { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 4px 0 10px; }
+.core { font-size: 11.5px; color: var(--muted); text-align: center; }
+.core .v { height: 42px; background: var(--soft); border-radius: 6px; position: relative; overflow: hidden; margin-bottom: 3px; }
+.core .v i { position: absolute; bottom: 0; left: 0; right: 0; background: var(--accent); transition: height .4s; }
+canvas.spark { width: 100%; height: 64px; display: block; }
+.pill { font-size: 11.5px; padding: 2px 9px; border-radius: 99px; background: var(--soft); color: var(--muted); font-weight: 600; text-transform: none; letter-spacing: 0; }
+.pill.ok { background: var(--good-soft); color: var(--good); } .pill.busy { background: var(--accent-soft); color: var(--accent); } .pill.warn { background: var(--bad-soft); color: var(--bad); }
+table.t { width: 100%; border-collapse: collapse; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+table.t th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+table.t td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+table.t tr.click { cursor: pointer; } table.t tr.click:hover td { background: var(--soft); } table.t tr.sel td { background: var(--accent-soft); }
+.meter { display: flex; align-items: center; gap: 8px; } .meter .bar { flex: 1; margin: 0; min-width: 60px; }
+.pass { color: var(--good); font-weight: 700; } .fail { color: var(--bad); font-weight: 700; }
+.logbox { font: 12.5px/1.55 ui-monospace, Menlo, Consolas, monospace; background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; max-height: 300px; overflow: auto; margin: 0; }
+.detail { padding: 6px 4px 14px; } .detail .md { font-size: 14px; }
+.note { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+
+/* ---------- permission box ---------- */
+.perm { border: 1px solid #f59e0b; background: color-mix(in srgb, #f59e0b 8%, var(--card)); border-radius: 12px; padding: 10px 14px; margin: 8px 0 12px; font-size: 14px; }
+.perm .pw { color: var(--muted); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+.perm .pb { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.perm button { border: 1px solid var(--line); background: var(--card); border-radius: 9px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+.perm button.yes { background: var(--accent); color: #fff; border-color: var(--accent); } .perm button:disabled { opacity: .5; cursor: default; }
+.perm .res { margin-top: 6px; font-weight: 600; } .perm .res.ok { color: var(--good); } .perm .res.no { color: var(--bad); }
+/* ---------- progress (switching / porting) ---------- */
+.progress { border: 1px solid var(--line); border-radius: 14px; background: var(--card); padding: 12px 16px; margin: 0 0 10px; box-shadow: var(--shadow); }
+.progress .pt { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; font-weight: 600; }
+.progress .ps { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.progress .bar { height: 8px; margin: 8px 0 2px; } .progress .bar i { background: linear-gradient(90deg, #22d3ee, #8b5cf6); }
+.steps { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; flex-wrap: wrap; }
+.steps span.on { color: var(--accent); font-weight: 600; } .steps span.ok { color: var(--good); }
+/* ---------- model chips on the welcome screen ---------- */
+.mchips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 0 0 20px; }
+.mchips button { border: 1px solid var(--line); background: var(--card); border-radius: 99px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+.mchips button.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.mchips button:disabled { opacity: .45; cursor: default; }
+/* ---------- files drawer ---------- */
+.filesbtn { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 6px 12px; cursor: pointer; font-size: 14px; box-shadow: var(--shadow); }
+.filesbtn:hover { border-color: var(--accent); }
+.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 92vw); background: var(--card); border-left: 1px solid var(--line); z-index: 15;
+          transform: translateX(100%); transition: transform .2s; display: flex; flex-direction: column; box-shadow: -10px 0 40px rgba(0,0,0,.12); }
+.drawer.on { transform: none; }
+.drawer .dh { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+.drawer .dl { flex: 1; overflow-y: auto; padding: 6px 8px; }
+.frow { display: flex; justify-content: space-between; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+.frow:hover { background: var(--soft); } .frow span:last-child { color: var(--muted); font-size: 12.5px; flex: none; }
+.frow.dir { color: var(--muted); cursor: default; } .frow.dir:hover { background: none; }
+.viewer { width: min(900px, 96vw); max-height: 86vh; display: flex; flex-direction: column; }
+.viewer pre { margin: 0; overflow: auto; flex: 1; padding: 14px 16px; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; background: var(--code); }
+.viewer .ph a { font-size: 13px; color: var(--accent); margin-left: 12px; font-weight: 500; }
+
+/* ---------- model picker ---------- */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; z-index: 20; align-items: flex-start; justify-content: center; padding-top: 8vh; }
+.overlay.on { display: flex; }
+.picker { width: min(620px, 94vw); background: var(--card); border-radius: 16px; border: 1px solid var(--line); box-shadow: 0 20px 60px rgba(0,0,0,.25); overflow: hidden; }
+.picker .ph { padding: 14px 18px; border-bottom: 1px solid var(--line); font-weight: 600; display: flex; justify-content: space-between; }
+.opt { display: flex; gap: 14px; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.opt:last-child { border-bottom: 0; } .opt .n { font-weight: 600; } .opt .d { font-size: 13px; color: var(--muted); }
+.opt .sc { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.opt button { margin-left: auto; flex: none; border: 1px solid var(--line); background: var(--card); border-radius: 9px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+.opt button:hover { border-color: var(--accent); color: var(--accent); } .opt button:disabled { opacity: .45; cursor: default; }
+.ivt { width: 100%; border-collapse: collapse; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+.ivt td, .ivt th { padding: 7px 18px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+.ivt td:first-child, .ivt th:first-child { text-align: left; white-space: normal; } .ivt th { color: var(--muted); font-weight: 500; font-size: 12px; }
+.ivbar { height: 8px; border-radius: 4px; background: var(--soft); overflow: hidden; margin: 6px 0 2px; } .ivbar i { display: block; height: 100%; background: var(--accent); }
+.ivsec { padding: 12px 18px 4px; font-weight: 600; font-size: 13px; }
+#ctx { cursor: pointer; }
+.cmds { background: var(--card); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 6px; overflow: hidden; }
+.cmds button { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: none; padding: 8px 14px; font: inherit; font-size: 13.5px; color: inherit; cursor: pointer; }
+.cmds button:last-child { border-bottom: 0; } .cmds button:hover { background: var(--soft); }
+.picker .pf { padding: 10px 18px; font-size: 12.5px; color: var(--muted); background: var(--soft); }
+
+@media (max-width: 980px) { .g4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .g2 { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  aside { position: fixed; z-index: 10; inset: 0 auto 0 0; transform: translateX(-100%); transition: transform .2s; }
+  aside.open { transform: none; box-shadow: 0 0 40px rgba(0,0,0,.3); }
+  .menu { display: block; } header { padding: 0 12px; } .thread, .composer { padding-left: 14px; padding-right: 14px; }
+  .chips { grid-template-columns: 1fr; } .g4 { grid-template-columns: 1fr; } .wrap { padding: 14px; }
+  .modelbtn small { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside id="side">
+    <div class="brand"><div class="logo">✦</div>Cluster AI</div>
+    <button class="newchat" id="newchat">＋&nbsp; New chat</button>
+    <div class="chats" id="chats"></div>
+    <nav>
+      <a href="#chat" data-v="chat">💬&nbsp; Chat</a>
+      <a href="#monitor" data-v="monitor">📈&nbsp; Monitor</a>
+      <a href="#bench" data-v="bench">🧪&nbsp; Benchmarks</a>
+      <a href="#" id="permlink">🔐&nbsp; Permissions</a>
+      <a href="#" id="usagelink">📊&nbsp; Usage</a>
+    </nav>
+    <div class="sidefoot"><span class="dot" id="sidedot"></span><span id="sidestat">connecting…</span><div class="health" id="health"></div></div>
+  </aside>
+
+  <main>
+    <header>
+      <button class="menu" id="menu" aria-label="menu">☰</button>
+      <h1 id="title">Chat</h1>
+      <div class="spacer"></div>
+      <button class="filesbtn" id="filesbtn" hidden>📁 Files</button>
+      <button class="modelbtn" id="modelbtn"><span class="dot" id="mdot"></span><span id="mname">…</span><small id="mkind"></small> ▾</button>
+    </header>
+
+    <!-- chat -->
+    <section class="view" id="v-chat">
+      <div id="scroll"><div class="thread" id="thread"></div></div>
+      <div class="composer"><div class="inner">
+        <div class="progress" id="prog" hidden><div class="pt"><span id="prog-t"></span><span id="prog-p"></span></div>
+          <div class="bar"><i id="prog-bar" style="width:0"></i></div><div class="ps" id="prog-s"></div><div class="steps" id="prog-steps"></div></div>
+        <div style="display:flex;justify-content:space-between;gap:10px"><div id="live"></div><div id="ctx" class="ctx"></div></div>
+        <div class="cmds" id="cmds" hidden></div>
+        <form class="box" id="f">
+          <textarea id="q" rows="1" placeholder="Message Cluster AI…" autofocus></textarea>
+          <button class="send" id="send" aria-label="send">↑</button>
+        </form>
+        <div class="hint">Type <b>/</b> for commands (/context, /usage, /permissions, /continue…) · Runs locally on two Mac minis · can search the web, read pages, run commands and Python (sandboxed) · Enter to send, Shift+Enter for a new line</div>
+      </div></div>
+    </section>
+
+    <!-- monitor -->
+    <section class="view" id="v-monitor"><div class="page"><div class="wrap">
+      <div class="grid g4">
+        <div class="card"><h3>Model <span class="pill" id="m-state">…</span></h3><div class="big" id="m-name" style="font-size:22px">…</div><div class="sub" id="m-kind"></div><div class="sub" id="m-ctx"></div></div>
+        <div class="card"><h3>Live speed <span class="pill" id="s-phase">idle</span></h3><div class="big" id="s-big">– <small>tok/s</small></div><div class="sub" id="s-sub">&nbsp;</div></div>
+        <div class="card"><h3>Last request <span class="pill ok" id="l-exact" hidden>exact</span></h3><div class="row"><span>read prompt</span><b id="l-pre">–</b></div><div class="row"><span>wrote</span><b id="l-gen">–</b></div><div class="row"><span>total time</span><b id="l-time">–</b></div></div>
+        <div class="card"><h3>Since start</h3><div class="row"><span>requests</span><b id="t-req">–</b></div><div class="row"><span>tokens read</span><b id="t-pre">–</b></div><div class="row"><span>tokens written</span><b id="t-gen">–</b></div><div class="row"><span>avg writing speed</span><b id="t-avg">–</b></div></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h3>Speed, last minute <span class="sub" style="text-transform:none;letter-spacing:0"><span style="color:var(--accent)">■</span> writing &nbsp; <span style="color:#f59e0b">■</span> reading prompt</span></h3><canvas class="spark" id="c-speed" style="height:120px"></canvas></div>
+      <div class="grid g2" style="margin-top:14px" id="nodes"></div>
+      <div class="card" style="margin-top:14px"><h3>AI processes on the cluster</h3>
+        <table class="t"><thead><tr><th>Mac</th><th>Program</th><th>Framework</th><th>Model</th><th>RAM</th><th>CPU</th></tr></thead><tbody id="procs"></tbody></table>
+        <div class="note">Detects llama.cpp, Ollama and similar runtimes, plus any Python process using PyTorch, OpenVINO, ONNX Runtime or TensorFlow. CPU 100% = one core.</div>
+      </div>
+
+    </div></div></section>
+
+    <!-- benchmarks -->
+    <section class="view" id="v-bench"><div class="page"><div class="wrap">
+      <div class="card" id="b-running" hidden><h3>Running now <span class="pill busy" id="b-run-label"></span></h3>
+        <div class="meter"><div class="bar"><i id="b-run-bar" style="width:0"></i></div><b id="b-run-count"></b></div>
+        <div class="grid g2" style="margin-top:10px">
+          <div><div class="sub" id="bl-q-title" style="margin-bottom:4px">Question</div><pre class="logbox" id="bl-q"></pre>
+               <div class="sub" style="margin:10px 0 4px">Recent results</div><div id="bl-verdicts"></div></div>
+          <div><div class="sub" id="bl-a-title" style="margin-bottom:4px">Answer (live)</div>
+               <details class="think" id="bl-think-box"><summary>Thinking</summary><div class="thinktext" id="bl-think"></div></details>
+               <div id="bl-tools"></div><div class="md" id="bl-a" style="font-size:14px"></div></div>
+        </div>
+        <details style="margin-top:10px"><summary class="sub" style="cursor:pointer">Raw progress log</summary><pre class="logbox" id="b-run-log"></pre></details></div>
+      <div class="card" style="margin-top:14px"><h3>Coding benchmark results</h3>
+        <table class="t"><thead><tr><th>Model</th><th>Write code (HumanEval, 40)</th><th>Fix bugs with tools (10)</th><th>Speed</th><th>Avg time / problem</th></tr></thead><tbody id="b-sum"></tbody></table>
+        <div class="note">Every answer is graded by running it against hidden tests in the sandbox. Click a model to see each problem, its answer and the test output.</div>
+      </div>
+      <div class="card" style="margin-top:14px" id="b-detail-card" hidden><h3 id="b-detail-title">Details</h3>
+        <table class="t"><thead><tr><th></th><th>Task</th><th>Part</th><th>Time</th><th>Tokens</th><th>Tool runs</th></tr></thead><tbody id="b-detail"></tbody></table></div>
+    </div></div></section>
+  </main>
+</div>
+
+<div class="drawer" id="drawer"><div class="dh"><span>📁 Workspace files</span><button class="menu" style="display:block;font-size:16px" id="dclose">✕</button></div>
+  <div class="note" style="padding:8px 18px 0">Files the AI created or ran in this conversation (sandboxed, no internet).</div><div class="dl" id="flist"></div></div>
+<div class="overlay" id="fview"><div class="picker viewer"><div class="ph"><span id="fv-name"></span><span><a id="fv-dl" href="#">Download</a><button class="menu" style="display:inline;font-size:16px;margin-left:10px" id="fvclose">✕</button></span></div><pre id="fv-body"></pre></div></div>
+<div class="overlay" id="permview"><div class="picker">
+  <div class="ph"><span>🔐 Websites the AI may use</span><button class="menu" style="display:block;font-size:16px" id="pvclose">✕</button></div>
+  <div id="pvlist"></div>
+  <div class="pf">From its workspace (pip, curl, git, Python) the AI can only reach websites you approve: it asks with a permission box
+    the first time. "For this chat" approvals last until the backend restarts. Local-network addresses are always blocked.</div>
+</div></div>
+<div class="overlay" id="infoview"><div class="picker viewer">
+  <div class="ph"><span id="iv-title"></span><button class="menu" style="display:block;font-size:16px" id="ivclose">✕</button></div>
+  <div id="iv-body" style="overflow:auto;max-height:75vh"></div></div></div>
+<div class="overlay" id="overlay"><div class="picker">
+  <div class="ph"><span>Choose a model</span><button class="menu" style="display:block;font-size:16px" id="pclose">✕</button></div>
+  <div id="plist"></div>
+  <div class="pf">Every model runs split across both Macs. Switching takes about a minute; scores are from the coding benchmark (write code / fix bugs).</div>
+</div></div>
+
+<script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
+<script src="/static/katex.min.js"></script>
+<script src="/static/highlight.min.js"></script>
+<script src="/static/mermaid.min.js"></script>
+<script>
+// ---------------------------------------------------------------- basics
+function reportError(what) {
+  try { navigator.sendBeacon("/api/clientlog", JSON.stringify({ what: String(what).slice(0, 2000), ua: navigator.userAgent })); } catch {}
+}
+addEventListener("error", (e) => reportError(`${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`));
+addEventListener("unhandledrejection", (e) => reportError("unhandled: " + (e.reason?.stack || e.reason)));
+const $ = (id) => document.getElementById(id);
+const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: dark ? "dark" : "default" });
+marked.use({ gfm: true, breaks: true });
+DOMPurify.addHook("afterSanitizeAttributes", (n) => { if (n.tagName === "A") { n.setAttribute("target", "_blank"); n.setAttribute("rel", "noopener noreferrer"); } });
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtBytes = (b) => b >= 1e6 ? (b / 1e6).toFixed(1) + " MB/s" : (b / 1e3).toFixed(0) + " KB/s";
+const fmtMB = (mb) => mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : mb + " MB";
+const store = { get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+                set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
+
+// ---------------------------------------------------------------- markdown / math / diagrams (unchanged pipeline)
+function render(md) {
+  const code = [], math = [];
+  let t = md.replace(/```[\s\S]*?(?:```|$)/g, (m) => `\u0000C${code.push(m) - 1}\u0000`)
+            .replace(/`[^`\n]+`/g, (m) => `\u0000C${code.push(m) - 1}\u0000`);
+  const put = (tex, display) => `MATHPH${math.push({ tex, display }) - 1}X`;
+  t = t.replace(/\$\$([\s\S]+?)\$\$/g, (_, x) => put(x, true))
+       .replace(/\\\[([\s\S]+?)\\\]/g, (_, x) => put(x, true))
+       .replace(/\\\(([\s\S]+?)\\\)/g, (_, x) => put(x, false))
+       .replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (m, x) => (/^[\d.,\s\-–]+$/.test(x) ? m : put(x, false)));
+  t = t.replace(/\u0000C(\d+)\u0000/g, (_, i) => code[+i]);
+  let html = DOMPurify.sanitize(marked.parse(t));
+  html = html.replace(/MATHPH(\d+)X/g, (_, i) => {
+    const m = math[+i];
+    try { return katex.renderToString(m.tex, { displayMode: m.display, throwOnError: false }); } catch { return esc(m.tex); }
+  });
+  return html;
+}
+let mmdCount = 0;
+function quoteNode(seg) {
+  const m = seg.match(/^(\s*[\w.-]+)(\[\[|\[\(|\(\(|\(\[|\{\{|\[\/|\[\\|\[|\(|\{|>)([\s\S]*)(\]\]|\)\]|\)\)|\]\)|\}\}|\/\]|\\\]|\]|\)|\})(\s*(?::::\w+)?\s*;?\s*)$/);
+  if (!m) return seg;
+  const [, id, open, label, close, rest] = m;
+  if (/^\s*".*"\s*$/.test(label)) return seg;
+  return `${id}${open}"${label.replace(/"/g, "#quot;")}"${close}${rest}`;
+}
+function fixMermaid(src) {
+  const edge = /(\s*(?:--\s[^-][^>]*?-->|-\.\s[^.]*?\.->|==\s[^=]*?==>|-->|---|-\.->|==>|--x|--o)(?:\|[^|]*\|)?\s*)/;
+  return src.split("\n").map((line) =>
+    /^\s*(graph|flowchart|subgraph|end\b|classDef|class\s|style|linkStyle|click|%%|direction)/.test(line) ? line
+      : line.split(edge).map((seg, i) => (i % 2 ? seg : quoteNode(seg))).join("")).join("\n");
+}
+async function decorate(el) {
+  el.querySelectorAll("table").forEach((tb) => { const w = document.createElement("div"); w.className = "table-wrap"; tb.replaceWith(w); w.appendChild(tb); });
+  const diagrams = [];
+  el.querySelectorAll("pre > code.language-mermaid").forEach((c) => {
+    const d = document.createElement("div"); d.className = "mermaid"; d.textContent = c.textContent; c.parentElement.replaceWith(d); diagrams.push(d);
+  });
+  el.querySelectorAll("pre > code").forEach((c) => {
+    try { hljs.highlightElement(c); } catch {}
+    const pre = c.parentElement, box = document.createElement("div"), head = document.createElement("div"), btn = document.createElement("button");
+    box.className = "codebox"; head.className = "codehead";
+    head.textContent = ((c.className.match(/language-(\w+)/) || [])[1] || "code");
+    btn.textContent = "Copy"; btn.onclick = () => copy(c.textContent, btn);
+    head.appendChild(btn); pre.replaceWith(box); box.append(head, pre);
+  });
+  for (const d of diagrams) {
+    const src = d.textContent; let good = null;
+    for (const cand of [src, fixMermaid(src)]) { try { if (await mermaid.parse(cand, { suppressErrors: true })) { good = cand; break; } } catch {} }
+    try { if (!good) throw 0; const { svg } = await mermaid.render("mmd" + (++mmdCount), good); d.innerHTML = svg; }
+    catch { const pre = document.createElement("pre"); pre.textContent = src; d.replaceWith(pre); }
+  }
+}
+function copy(text, btn) {
+  const done = () => { const o = btn.textContent; btn.textContent = "Copied"; setTimeout(() => (btn.textContent = o), 1200); };
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done)); else fallbackCopy(text, done);
+}
+function fallbackCopy(text, done) {   // plain-http pages (Tailscale IP) have no clipboard API on some browsers
+  const ta = document.createElement("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select(); try { document.execCommand("copy"); done(); } catch {} ta.remove();
+}
+
+// ---------------------------------------------------------------- navigation
+const TITLES = { chat: "Chat", monitor: "Monitor", bench: "Benchmarks" };
+let current = "chat";
+function show(v) {
+  if (!TITLES[v]) v = "chat";
+  current = v;
+  document.querySelectorAll(".view").forEach((x) => x.classList.toggle("on", x.id === "v-" + v));
+  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("on", a.dataset.v === v));
+  $("title").textContent = TITLES[v]; $("side").classList.remove("open");
+  if (v === "bench") loadBench();
+  if (v === "monitor") pollStats();
+}
+addEventListener("hashchange", () => show(location.hash.slice(1)));
+$("menu").onclick = () => $("side").classList.toggle("open");
+
+// ---------------------------------------------------------------- conversations (stored on node1: every device sees the same list)
+let chats = [];                                   // [{id, title, updated, n, pending}]
+let openConv = null;                               // the full conversation on screen
+let active = store.get("cluster-ai-active", null);
+const chat = () => openConv;
+async function api(path, opts = {}) {
+  const r = await fetch(path, { cache: "no-store", ...opts });
+  if (!r.ok) throw new Error(`${path}: ${r.status}`);
+  return r.json();
+}
+async function loadList() { try { chats = await api("/api/chats"); drawList(); return true; } catch { return false; } }
+async function openChat(id) {
+  active = id; store.set("cluster-ai-active", id);
+  try { openConv = id ? await api("/api/chats/" + encodeURIComponent(id)) : null; } catch { openConv = null; active = null; }
+  drawList(); await drawThread(); watchPending();
+}
+async function migrateLocal() {                   // conversations the previous version kept only in this browser: upload once
+  if (store.get("cluster-ai-migrated", false)) return;
+  for (const c of store.get("cluster-ai-chats", [])) {
+    try { await fetch("/api/chats/" + encodeURIComponent(c.id), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(c) }); } catch { return; }
+  }
+  store.set("cluster-ai-migrated", true);
+}
+function newChat() { active = null; openConv = null; store.set("cluster-ai-active", null); drawList(); drawThread(); $("q").focus(); location.hash = "chat"; show("chat"); }
+function drawList() {
+  const el = $("chats"); el.innerHTML = chats.length ? '<div class="label">Recent</div>' : "";
+  for (const c of chats) {
+    const d = document.createElement("div"); d.className = "chatitem" + (c.id === active ? " on" : "");
+    const s = document.createElement("span"); s.textContent = (c.pending ? "● " : "") + c.title;
+    if (c.pending) s.title = "being answered right now";
+    const x = document.createElement("button"); x.className = "del"; x.title = "Delete"; x.textContent = "✕";
+    x.onclick = async (e) => { e.stopPropagation(); if (busy) return;
+      if (!confirm(`Delete "${c.title}"?\nIts messages and workspace files are removed on every device.`)) return;
+      try { await fetch("/api/chats/" + encodeURIComponent(c.id), { method: "DELETE" }); } catch {}
+      if (active === c.id) newChat(); loadList(); };
+    d.onclick = () => { if (busy) return; openChat(c.id); location.hash = "chat"; show("chat"); };
+    d.append(s, x); el.appendChild(d);
+  }
+}
+$("newchat").onclick = () => { if (!busy) newChat(); };
+
+const SUGGEST = [
+  ["Explain how these two Mac minis run one AI together", "tensor parallelism, simply"],
+  ["Write a Python function that checks if a number is prime, and test it", "it runs and tests the code itself"],
+  ["What's the latest news about open-source AI models?", "searches the web"],
+  ["How much free disk space and memory does this computer have?", "runs commands"],
+];
+function drawCtx() {
+  const st = [...(openConv?.messages || [])].reverse().find((m) => m.role === "assistant" && m.stats?.context)?.stats;
+  if (!st || !st.n_ctx) { $("ctx").innerHTML = ""; return; }
+  const pct = st.context / st.n_ctx, cls = pct >= 0.9 ? "bad" : pct >= 0.7 ? "warn" : "";
+  $("ctx").innerHTML = `memory <b class="${cls}">${(st.context / 1000).toFixed(1)}k / ${Math.round(st.n_ctx / 1000)}k</b>` +
+    (pct >= 0.8 ? ` · <b class="${cls}">almost full, start a new chat</b>` : "");
+  $("ctx").title = "How much of the model's conversation memory this chat uses. When it's full, the start of the chat gets cut off.";
+}
+async function drawThread() {
+  const t = $("thread"); t.innerHTML = "";
+  $("filesbtn").hidden = !active; drawCtx();
+  const c = chat();
+  if (!c || !c.messages.length) {
+    t.innerHTML = `<div class="welcome"><div class="logo">✦</div><h2>What can I help with?</h2>
+      <p>A local AI running on two Mac minis, no cloud. <span id="wmodel"></span></p><div class="mchips" id="mchips"></div><div class="chips"></div></div>`;
+    drawModelChips();
+    const chipsEl = t.querySelector(".chips");
+    const last = chats.find((x) => x.n);
+    if (last) { const b = document.createElement("button"); b.innerHTML = `↩︎ Continue “${esc(last.title)}”<small>your latest chat · ${last.n} messages</small>`;
+      b.onclick = () => openChat(last.id); chipsEl.appendChild(b); }
+    for (const [q, why] of SUGGEST) {
+      const b = document.createElement("button"); b.innerHTML = `${esc(q)}<small>${esc(why)}</small>`;
+      b.onclick = () => { $("q").value = q; send(); }; chipsEl.appendChild(b);
+    }
+    return;
+  }
+  for (const m of c.messages) await drawMessage(m);
+  $("scroll").scrollTop = $("scroll").scrollHeight;
+}
+function msgEl(role) {
+  const d = document.createElement("div"); d.className = "msg " + role;
+  if (role === "user") { const b = document.createElement("div"); b.className = "bubble"; d.appendChild(b); }
+  else { d.innerHTML = `<div class="who"><div class="logo">✦</div><span class="mm"></span></div><div class="parts"></div>`; }
+  $("thread").appendChild(d); return d;
+}
+function thinkEl(parent, text, secs) {
+  const d = document.createElement("details"); d.className = "think";
+  d.innerHTML = `<summary></summary><div class="thinktext"></div>`;
+  d.querySelector("summary").textContent = secs ? `Thought for ${secs}s` : "Thinking…";
+  d.querySelector(".thinktext").textContent = text; parent.appendChild(d); return d;
+}
+function toolEl(parent, ev) {
+  const d = document.createElement("details"); d.className = "tool";
+  const icons = { web_search: "🔎", fetch_url: "🌐", run_command: "💻", run_python: "🐍" };
+  const arg = ev.args?.command || ev.args?.query || ev.args?.url || (ev.args?.code ? "Python program" : "");
+  d.innerHTML = `<summary></summary>`;
+  d.querySelector("summary").textContent = `${icons[ev.tool] || "🔧"} ${ev.tool}: ${arg}` + (ev.seconds != null ? ` · ${ev.seconds}s` : " · running…");
+  if (ev.args?.code) { const p = document.createElement("pre"); p.className = "toolcode"; p.textContent = ev.args.code; d.appendChild(p); }
+  if (ev.result != null) { const p = document.createElement("pre"); p.className = "toolcode"; p.textContent = ev.result; d.appendChild(p); }
+  parent.appendChild(d); return d;
+}
+function statsEl(parent, m) {
+  const s = m.stats; const d = document.createElement("div"); d.className = "stats";
+  if (s) d.innerHTML = `<span>⚡ <b>${s.tps}</b> tok/s</span><span>${s.tokens} tokens</span><span>prompt ${s.prompt_tokens} @ ${s.prompt_tps}/s</span>` + (m.seconds ? `<span>${m.seconds}s</span>` : "");
+  const a = document.createElement("span"); a.className = "actions";
+  const cb = document.createElement("button"); cb.textContent = "Copy"; cb.onclick = () => copy(m.content, cb); a.appendChild(cb);
+  d.appendChild(a); parent.appendChild(d);
+}
+async function drawMessage(m) {
+  const d = msgEl(m.role);
+  if (m.role === "user") { d.querySelector(".bubble").textContent = m.content; return; }
+  d.querySelector(".mm").textContent = m.model || "";
+  const parts = d.querySelector(".parts");
+  for (const s of m.steps || []) {
+    if (s.think) thinkEl(parts, s.think, s.thinkSecs);
+    if (s.tool) toolEl(parts, s.tool);
+    if (s.perm) { const p = document.createElement("div"); p.className = "stats";
+      const ok = s.perm.decision === "chat" || s.perm.decision === "always";
+      p.textContent = `🔐 ${s.perm.site}: ${({ chat: "allowed for this chat", always: "always allowed", deny: "denied" })[s.perm.decision] || s.perm.decision}`;
+      p.style.color = ok ? "var(--good)" : "var(--bad)"; parts.appendChild(p); }
+    if (s.note) { const n = document.createElement("div"); n.className = "md"; n.innerHTML = render(s.note); parts.appendChild(n); }
+  }
+  const md = document.createElement("div"); md.className = "md"; md.innerHTML = render(m.content || ""); parts.appendChild(md);
+  await decorate(md);
+  statsEl(parts, m);
+}
+
+function permCard(parent, ev, cmd) {
+  const d = document.createElement("div"); d.className = "perm"; d.id = "perm-" + ev.id;
+  d.innerHTML = `<div>🔐 The AI wants to connect to <b></b><span class="pw" style="margin-left:6px"></span></div><div class="pw pfor"></div>
+    <div class="pb"><button class="yes" data-d="chat">Allow for this chat</button><button data-d="always">Always allow</button><button data-d="deny">Deny</button></div><div class="res"></div>`;
+  d.querySelector("b").textContent = ev.site;
+  if (ev.host && ev.host !== ev.site) d.querySelector("span.pw").textContent = `(${ev.host})`;
+  d.querySelector(".pfor").textContent = cmd ? `for: ${cmd.slice(0, 160)}` : "";
+  d.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
+    d.querySelectorAll("button").forEach((x) => (x.disabled = true)); d.querySelector(".res").textContent = "sending…";
+    try { await fetch("/api/permission", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: ev.id, decision: b.dataset.d }) }); }
+    catch { d.querySelector(".res").textContent = "couldn't reach the backend"; d.querySelectorAll("button").forEach((x) => (x.disabled = false)); }
+  }));
+  parent.appendChild(d);
+}
+$("permlink").onclick = (e) => { e.preventDefault(); openPerms(); };
+$("usagelink").onclick = (e) => { e.preventDefault(); openUsage(); };
+$("ctx").onclick = () => openContext();
+$("ivclose").onclick = () => $("infoview").classList.remove("on");
+$("infoview").onclick = (e) => { if (e.target.id === "infoview") $("infoview").classList.remove("on"); };
+const fmtN = (n) => (n || 0).toLocaleString();
+const fmtT = (s) => { s = Math.round(s || 0); return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.round(s % 3600 / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`; };
+function info(title, html) { $("iv-title").textContent = title; $("iv-body").innerHTML = html; $("infoview").classList.add("on"); }
+async function openContext() {
+  if (!active) { info("🧠 Conversation memory", `<div class="opt"><span class="sub">Start or open a chat first.</span></div>`); return; }
+  info("🧠 Conversation memory", `<div class="opt">counting…</div>`);
+  let r; try { r = await api("/api/context/" + encodeURIComponent(active)); } catch { $("iv-body").innerHTML = `<div class="opt">backend offline</div>`; return; }
+  const used = r.measured || r.estimate, pct = r.n_ctx ? Math.min(100, used / r.n_ctx * 100) : 0;
+  let html = `<div style="padding:12px 18px"><div><b>${fmtN(used)}</b> of ${fmtN(r.n_ctx)} tokens used (${pct.toFixed(0)}%) · ${esc(r.model || "")}</div>
+    <div class="ivbar"><i style="width:${pct}%;${pct >= 90 ? "background:var(--bad)" : pct >= 70 ? "background:#f59e0b" : ""}"></i></div>
+    <div class="sub">${r.measured ? "measured on the last reply" : "estimate"} · ${fmtN(Math.max(0, r.n_ctx - used))} tokens left · ${r.messages} messages.
+    When it's full, the start of the chat gets cut off, so start a new chat for a new topic.</div></div>
+    <table class="ivt"><tr><th>What's in memory</th><th>Tokens</th><th>Share</th></tr>`;
+  const tot = r.parts.reduce((a, p) => a + p.tokens, 0) || 1;
+  for (const p of r.parts) html += `<tr><td>${esc(p.what)}</td><td>${fmtN(p.tokens)}</td><td>${(p.tokens / tot * 100).toFixed(0)}%</td></tr>`;
+  $("iv-body").innerHTML = html + "</table>";
+}
+async function openUsage() {
+  info("📊 Usage", `<div class="opt">loading…</div>`);
+  let u; try { u = await api("/api/usage" + (active ? "?chat=" + encodeURIComponent(active) : "")); } catch { $("iv-body").innerHTML = `<div class="opt">backend offline</div>`; return; }
+  const row = (name, a) => `<tr><td>${esc(name)}</td><td>${fmtN(a.replies)}</td><td>${fmtN(a.tokens_read)}</td><td>${fmtN(a.tokens_written)}</td><td>${a.avg_write_tps ?? "–"}</td><td>${fmtN(a.tool_runs)}</td><td>${fmtT(a.ai_seconds)}</td></tr>`;
+  const head = `<tr><th></th><th>Replies</th><th>Read</th><th>Written</th><th>tok/s</th><th>Tool runs</th><th>AI time</th></tr>`;
+  let html = `<table class="ivt">${head}` + (u.chat ? row("This chat", u.chat) : "") + row("Today", u.today) + row("Last 7 days", u.week) + row("All time", u.all) + "</table>";
+  html += `<div class="ivsec">By model</div><table class="ivt">${head}`;
+  for (const [m, a] of Object.entries(u.by_model)) html += row(m, a);
+  html += "</table>";
+  if (u.server) html += `<div class="ivsec">AI server since the backend started <span class="sub">(includes benchmarks)</span></div>
+    <table class="ivt"><tr><td>requests</td><td>${fmtN(u.server.replies)}</td></tr><tr><td>tokens read</td><td>${fmtN(u.server.tokens_read)}</td></tr>
+    <tr><td>tokens written</td><td>${fmtN(u.server.tokens_written)}</td></tr><tr><td>AI time</td><td>${fmtT(u.server.ai_seconds)}</td></tr></table>`;
+  $("iv-body").innerHTML = html + `<div class="pf">Counted from the saved transcripts${u.since ? " since " + esc(u.since) : ""}.</div>`;
+}
+function openChatList(title) {
+  let html = "";
+  for (const [i, c] of chats.entries()) html += `<div class="opt"><div><div class="n">${i + 1}. ${esc(c.title)}</div><div class="d">${c.n ?? 0} messages · ${esc(c.updated ? new Date(c.updated * 1000).toLocaleString() : "")}</div></div><button data-id="${esc(c.id)}">Continue</button></div>`;
+  info(title, html || `<div class="opt"><span class="sub">No saved chats yet.</span></div>`);
+  $("iv-body").querySelectorAll("button[data-id]").forEach((b) => b.onclick = () => { $("infoview").classList.remove("on"); openChat(b.dataset.id); location.hash = "chat"; show("chat"); });
+}
+const COMMANDS = [
+  ["/context", "what fills this chat's memory", () => openContext()],
+  ["/usage", "tokens, speed and AI time", () => openUsage()],
+  ["/permissions", "websites the AI may use", () => openPerms()],
+  ["/continue", "continue your latest chat", () => { const c = chats.find((x) => x.id !== active) || chats[0]; if (c) openChat(c.id); }],
+  ["/chats", "pick a past chat to continue", () => openChatList("💬 Continue a chat")],
+  ["/new", "start a new chat", () => newChat()],
+  ["/models", "switch model", () => openPicker()],
+  ["/files", "this chat's workspace files", () => active && openFiles()],
+  ["/monitor", "live cluster monitor", () => { location.hash = "monitor"; show("monitor"); }],
+  ["/bench", "benchmark results", () => { location.hash = "bench"; show("bench"); }],
+  ["/help", "list commands", () => info("⌨️ Commands", COMMANDS.map(([c, d]) => `<div class="opt"><div><div class="n">${c}</div><div class="d">${d}</div></div></div>`).join(""))],
+];
+function runCommand(text) {
+  const cmd = COMMANDS.find(([c]) => c === text.split(/\s+/)[0].toLowerCase());
+  if (!cmd) { info("⌨️ Unknown command", `<div class="opt"><span class="sub">${esc(text)} isn't a command. Type /help to see them.</span></div>`); return; }
+  cmd[2]();
+}
+$("pvclose").onclick = () => $("permview").classList.remove("on");
+$("permview").onclick = (e) => { if (e.target.id === "permview") $("permview").classList.remove("on"); };
+async function openPerms() {
+  $("permview").classList.add("on"); $("pvlist").innerHTML = `<div class="opt">loading…</div>`;
+  let p; try { p = await api("/api/permissions"); } catch { $("pvlist").innerHTML = `<div class="opt">backend offline</div>`; return; }
+  $("pvlist").innerHTML = p.always.length ? "" : `<div class="opt"><span class="sub">No websites are always allowed yet.</span></div>`;
+  for (const site of p.always) {
+    const o = document.createElement("div"); o.className = "opt";
+    o.innerHTML = `<div><div class="n"></div><div class="d">always allowed</div></div><button>Remove</button>`;
+    o.querySelector(".n").textContent = site;
+    o.querySelector("button").onclick = async () => {
+      await fetch("/api/permissions/revoke", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ site }) });
+      openPerms(); };
+    $("pvlist").appendChild(o);
+  }
+}
+
+// ---------------------------------------------------------------- sending (resumable job, stop button)
+let busy = false, jobId = null, watching = null;
+const ta = $("q");
+const grow = () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; };
+ta.addEventListener("input", grow);
+ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("f").requestSubmit(); } });
+$("f").addEventListener("submit", (e) => { e.preventDefault(); ta.value.trim().startsWith("/") ? send() : busy ? stop() : send(); });
+// command suggestions while typing "/"
+ta.addEventListener("input", () => {
+  const v = ta.value, box = $("cmds");
+  const list = /^\/[a-z]*$/i.test(v) ? COMMANDS.filter(([c]) => c.startsWith(v.toLowerCase())) : [];
+  box.hidden = !list.length; box.innerHTML = "";
+  for (const [c, d] of list) { const b = document.createElement("button"); b.type = "button"; b.innerHTML = `<b>${c}</b> <span class="sub">${d}</span>`;
+    b.onmousedown = (e) => { e.preventDefault(); ta.value = ""; grow(); box.hidden = true; runCommand(c); }; box.appendChild(b); }
+});
+ta.addEventListener("blur", () => setTimeout(() => $("cmds").hidden = true, 150));
+function setBusy(b) { busy = b; const s = $("send"); s.classList.toggle("stop", b); s.textContent = b ? "■" : "↑"; s.setAttribute("aria-label", b ? "stop" : "send"); }
+async function stop() { if (jobId) { try { await fetch(`/api/chat_cancel?id=${jobId}`, { method: "POST" }); } catch {} $("live").textContent = "stopping…"; } }
+
+async function send() {
+  const text = ta.value.trim(); if (!text) return;
+  if (/^\/[a-z]+$/i.test(text.split(/\s+/)[0]) && !text.includes("\n")) { ta.value = ""; grow(); runCommand(text); return; }
+  if (busy || $("send").disabled) return;
+  ta.value = ""; grow(); setBusy(true);
+  let c = openConv;
+  if (!c) {
+    c = openConv = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: text.slice(0, 60), messages: [] };
+    active = c.id; store.set("cluster-ai-active", active);
+  }
+  c.messages.push({ role: "user", content: text });
+  if (c.messages.length === 1) $("thread").innerHTML = "";
+  await drawMessage(c.messages.at(-1));
+  let jid;
+  try {
+    jid = (await api("/api/chat_start", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: c.id, title: c.title,
+        messages: c.messages.filter((x) => x.role === "user" || x.role === "assistant").map((x) => ({ role: x.role, content: x.content })) }) })).id;
+  } catch (err) {
+    c.messages.pop(); setBusy(false); $("thread").lastElementChild?.remove();
+    $("live").textContent = "⚠️ couldn't reach the AI backend: " + err; return;
+  }
+  loadList();
+  await runJob(jid);
+}
+
+// follow a job's events (our own question, or one being answered on another device) until it is done
+async function runJob(jid) {
+  jobId = jid; setBusy(true); watching = jid;
+  const m = { role: "assistant", content: "", steps: [], model: modelName };
+  const d = msgEl("assistant"); d.querySelector(".mm").textContent = modelName;
+  const parts = d.querySelector(".parts");
+  let md = null, think = null, thinkText = "", thinkStart = 0, pending = false, tok = 0, stamps = [], phase = "reading", pendingTool = null;
+  let seen = 0, finished = false, lastCmd = "";
+  const t0 = Date.now();
+  const follow = () => { const s = $("scroll"); if (s.scrollHeight - s.scrollTop - s.clientHeight < 160) s.scrollTop = s.scrollHeight; };
+  follow(); $("scroll").scrollTop = $("scroll").scrollHeight;
+  const rate = () => { const now = Date.now(); while (stamps.length && now - stamps[0] > 2000) stamps.shift();
+    return stamps.length > 2 ? (stamps.length - 1) / ((stamps.at(-1) - stamps[0]) / 1000) : 0; };
+  const tick = setInterval(() => {
+    const r = rate(), secs = Math.round((Date.now() - t0) / 1000);
+    if ($("live").textContent.startsWith("📶") || $("live").textContent === "stopping…") return;
+    $("live").textContent = phase === "tool" ? `🔧 running a tool… ${secs}s` : phase === "reading" ? `⏳ reading… ${secs}s`
+      : `${phase === "thinking" ? "💭 thinking" : "✍️ writing"} · ${r ? r.toFixed(1) : "–"} tok/s · ${tok} tokens · ${secs}s`;
+  }, 200);
+  const paint = () => { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; if (md) { md.innerHTML = render(m.content); follow(); } }); };
+  const closeThink = () => { if (think) { const secs = Math.max(1, Math.round((Date.now() - thinkStart) / 1000));
+    think.querySelector("summary").textContent = `Thought for ${secs}s`; m.steps.push({ think: thinkText, thinkSecs: secs }); think = null; thinkText = ""; } };
+  const onEvent = async (ev) => {
+    if (ev.type === "thinking") {
+      tok++; stamps.push(Date.now()); phase = "thinking";
+      if (!think) { think = thinkEl(parts, "", 0); thinkStart = Date.now(); }
+      thinkText += ev.text; think.querySelector(".thinktext").textContent = thinkText; follow();
+    } else if (ev.type === "token") {
+      tok++; stamps.push(Date.now()); phase = "writing"; closeThink();
+      if (!md) { md = document.createElement("div"); md.className = "md cursor"; parts.appendChild(md); }
+      m.content += ev.text; paint();
+    } else if (ev.type === "permission") {
+      closeThink(); permCard(parts, ev, lastCmd); follow();
+    } else if (ev.type === "permission_result") {
+      const card = document.getElementById("perm-" + ev.id);
+      if (card) { card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+        const ok = ev.decision === "chat" || ev.decision === "always";
+        const r = card.querySelector(".res"); r.className = "res " + (ok ? "ok" : "no");
+        r.textContent = ({ chat: "✓ allowed for this chat", always: "✓ always allowed", deny: "✗ denied" }[ev.decision] || ev.decision) + (ev.note ? ` (${ev.note})` : ""); }
+    } else if (ev.type === "stats") { m.stats = ev;
+    } else if (ev.type === "tool_start") {
+      closeThink(); phase = "tool"; lastCmd = ev.args?.command || (ev.args?.code ? "Python program" : "");
+      if (md) { if (m.content.trim()) { md.classList.remove("cursor"); md.innerHTML = render(m.content); await decorate(md); m.steps.push({ note: m.content }); } else md.remove(); }
+      md = null; m.content = ""; pendingTool = toolEl(parts, ev); follow();
+    } else if (ev.type === "tool") {
+      pendingTool?.remove(); pendingTool = null; toolEl(parts, ev); m.steps.push({ tool: ev }); phase = "reading"; stamps = []; follow();
+    } else if (ev.type === "done") {
+      closeThink(); finished = true;
+      m.content = ev.answer || m.content;
+      if (!md) { md = document.createElement("div"); md.className = "md"; parts.appendChild(md); }
+      md.classList.remove("cursor"); md.innerHTML = render(m.content); await decorate(md);
+      m.seconds = ((Date.now() - t0) / 1000).toFixed(1); statsEl(parts, m); follow();
+    } else if (ev.type === "error") {
+      closeThink(); finished = true; m.content += `\n\n**Error:** ${ev.error}`;
+      if (!md) { md = document.createElement("div"); md.className = "md"; parts.appendChild(md); }
+      md.classList.remove("cursor"); md.innerHTML = render(m.content);
+    }
+  };
+  try {
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (!finished && Date.now() < deadline) {
+      try {
+        const r = await fetch(`/api/chat_events?id=${jobId}&from=${seen}`, { cache: "no-store" });
+        if (r.status === 404) throw new Error("the server lost this question (was it restarted?)");
+        const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true }); let i;
+          while ((i = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, i); buf = buf.slice(i + 1);
+            if (!line.trim()) continue;
+            const ev = JSON.parse(line); if (ev.type === "ping") continue;
+            seen++; if ($("live").textContent.startsWith("📶")) $("live").textContent = ""; await onEvent(ev);
+          }
+        }
+      } catch (err) {
+        if (String(err).includes("lost this question")) throw err;
+        reportError("reconnecting after: " + err); $("live").textContent = "📶 connection dropped, reconnecting…";
+        await new Promise((res) => { const t = setTimeout(res, 1500);
+          document.addEventListener("visibilitychange", () => { if (!document.hidden) { clearTimeout(t); res(); } }, { once: true }); });
+      }
+    }
+    if (!finished) throw new Error("no answer after 10 minutes");
+  } catch (err) {
+    reportError("stream: " + err); m.content += `\n\n**Error:** ${String(err)}`;
+    const e = document.createElement("div"); e.className = "md"; e.innerHTML = render(`**Error:** ${esc(String(err))}`); parts.appendChild(e);
+  }
+  clearInterval(tick); $("live").textContent = "";
+  jobId = null; watching = null;
+  // the server saves the finished answer itself; wait for that, then show its saved copy (the same on every device)
+  for (let i = 0; i < 20 && active; i++) {
+    try { const c = await api("/api/chats/" + encodeURIComponent(active)); if (!c.pending) break; } catch { break; }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  setBusy(false);
+  if (active) await openChat(active);
+  loadList(); ta.focus();
+  if ($("drawer").classList.contains("on")) openFiles();
+}
+
+// a conversation whose answer is still being written (e.g. started on another device): watch it live
+function watchPending() {
+  if (busy || !openConv?.pending || watching === openConv.pending.job) return;
+  runJob(openConv.pending.job);
+}
+
+// keep every device in sync
+setInterval(async () => {
+  if (!(await loadList()) || busy) return;
+  if (!active) return;
+  const meta = chats.find((c) => c.id === active);
+  if (!meta) { newChat(); return; }                                   // deleted on another device
+  if (!openConv || meta.updated > (openConv.updated || 0) + 0.001 || (meta.pending && !openConv.pending)) openChat(active);
+}, 4000);
+
+// ---------------------------------------------------------------- model picker
+let modelName = "", switching = false;
+$("modelbtn").onclick = openPicker; $("pclose").onclick = () => $("overlay").classList.remove("on");
+$("overlay").onclick = (e) => { if (e.target.id === "overlay") $("overlay").classList.remove("on"); };
+async function openPicker() {
+  $("overlay").classList.add("on"); $("plist").innerHTML = `<div class="opt">Loading…</div>`;
+  let r; try { r = await (await fetch("/api/models", { cache: "no-store" })).json(); } catch { $("plist").innerHTML = `<div class="opt">backend offline</div>`; return; }
+  $("plist").innerHTML = "";
+  for (const m of r.models) {
+    const o = document.createElement("div"); o.className = "opt";
+    const b = m.bench ? `write code ${m.bench.write_pct}% · fix bugs ${m.bench.fix_pct}% · ${m.bench.gen_tps} tok/s` : "not benchmarked yet";
+    o.innerHTML = `<div><div class="n"></div><div class="d"></div><div class="sc"></div></div><button></button>`;
+    o.querySelector(".n").textContent = m.name; o.querySelector(".d").textContent = m.good_for; o.querySelector(".sc").textContent = b;
+    const btn = o.querySelector("button");
+    btn.textContent = m.loaded ? "In use" : r.switching.busy && r.switching.target === m.preset ? "Switching…" : m.available ? "Use" : "Not installed";
+    btn.disabled = m.loaded || !m.available || r.switching.busy || busy;
+    btn.onclick = () => doSwitch(m, btn);
+    $("plist").appendChild(o);
+  }
+}
+async function doSwitch(m, btn, force = false) {
+  if (btn) { btn.textContent = "Switching…"; btn.disabled = true; }
+  const ok = await switchModel(m.preset, m.name, force);
+  if (ok) $("overlay").classList.remove("on"); else openPicker();
+}
+
+// switch the whole cluster to another model; the progress card shows the loading, then (mid-conversation) the porting
+let portAfterSwitch = null;
+async function switchModel(preset, name, force = false) {
+  const r = await fetch("/api/switch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ preset, force }) });
+  const j = await r.json();
+  if (r.status === 409 && !force) { if (confirm(`${j.error}.\nSwitch to ${name} anyway?`)) return switchModel(preset, name, true); return false; }
+  if (!r.ok) { alert(j.error || "could not switch"); return false; }
+  portAfterSwitch = (openConv && openConv.messages?.length) ? openConv.id : null;   // carry this conversation over
+  switching = true; progTick();
+  return true;
+}
+let modelsCache = null;
+async function drawModelChips() {
+  const el = document.getElementById("mchips"); if (!el) return;
+  try { modelsCache = await api("/api/models"); } catch { return; }
+  el.innerHTML = "";
+  for (const m of modelsCache.models.filter((x) => x.available)) {
+    const b = document.createElement("button"); b.className = m.loaded ? "on" : "";
+    b.textContent = m.name; b.title = m.good_for;
+    b.disabled = modelsCache.switching.busy || busy;
+    b.onclick = () => { if (!m.loaded) switchModel(m.preset, m.name).then(() => drawModelChips()); };
+    el.appendChild(b);
+  }
+}
+
+// one watcher for switching and porting, so every device shows the same progress (whoever started it)
+let progOn = false, portStarted = 0;
+async function progTick() {
+  let sw = null, pt = null, st = null;
+  try { sw = await api("/api/switch"); pt = await api("/api/port"); } catch { return; }
+  const steps = (cur) => ["stop", "load", "warm up", "port"].map((x, i) => `<span class="${i < cur ? "ok" : i === cur ? "on" : ""}">${i < cur ? "✓" : "•"} ${x}</span>`).join("");
+  if (sw.busy) {
+    const pct = Math.round(100 * (sw.progress || 0));
+    const phase = { stopping: "stopping the current model", loading: "loading the weights into both Macs' memory", warming: "warming up", ready: "ready" }[sw.phase] || sw.phase;
+    showProg(`Switching to ${sw.name || sw.target}`, `${pct}%`, pct, `${phase} · ${sw.elapsed}s`, steps({ stopping: 0, loading: 1, warming: 2, ready: 3 }[sw.phase] ?? 0));
+  } else if (pt.busy) {
+    try { st = await api("/api/stats"); } catch {}
+    const a = st?.ai || {}, total = a.prompt_total || 0, done = a.prompt_done || 0;
+    const pct = a.phase === "writing" ? 100 : total ? Math.round(100 * done / total) : 3;
+    showProg(`Porting this conversation to ${a.model?.name || "the new model"}`, total ? `${done.toLocaleString()} / ${total.toLocaleString()} tokens` : "…", pct,
+      `the new model is reading the whole conversation, so it can answer with full context${a.prefill_tps ? ` · ${a.prefill_tps} tok/s` : ""}`, steps(3));
+  } else if (portAfterSwitch && sw.phase === "ready") {
+    const cid = portAfterSwitch; portAfterSwitch = null;
+    try { await fetch("/api/port", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: cid }) }); } catch {}
+    portStarted = Date.now();
+  } else if (progOn) {
+    showProg("Ready", "100%", 100, `now running ${modelName}` + (pt.tokens ? ` · conversation ported (${pt.tokens.toLocaleString()} tokens)` : ""), steps(4));
+    setTimeout(() => { if (!document.getElementById("prog").hidden && $("prog-t").textContent === "Ready") { $("prog").hidden = true; progOn = false; } }, 2500);
+    switching = false; drawModelChips();
+  }
+  $("send").disabled = !!(sw.busy || pt.busy);
+}
+function showProg(title, right, pct, sub, stepsHtml) {
+  progOn = true; $("prog").hidden = false;
+  $("prog-t").textContent = title; $("prog-p").textContent = right; $("prog-bar").style.width = Math.max(2, Math.min(100, pct)) + "%";
+  $("prog-s").textContent = sub; $("prog-steps").innerHTML = stepsHtml;
+}
+setInterval(progTick, 800);
+
+// ---------------------------------------------------------------- files in this conversation's workspace
+$("filesbtn").onclick = openFiles; $("dclose").onclick = () => $("drawer").classList.remove("on");
+$("fvclose").onclick = () => $("fview").classList.remove("on");
+$("fview").onclick = (e) => { if (e.target.id === "fview") $("fview").classList.remove("on"); };
+const fmtSize = (b) => b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(1) + " KB" : b + " B";
+async function openFiles() {
+  if (!active) return;
+  $("drawer").classList.add("on"); $("flist").innerHTML = `<div class="sub" style="padding:10px">loading…</div>`;
+  let files = []; try { files = await api("/api/files/" + encodeURIComponent(active)); } catch {}
+  $("flist").innerHTML = files.length ? "" : `<div class="sub" style="padding:10px">No files yet. Ask the AI to create or run something.</div>`;
+  for (const f of files) {
+    const d = document.createElement("div"); d.className = "frow" + (f.dir ? " dir" : "");
+    const depth = f.path.split("/").length - 1;
+    d.innerHTML = `<span></span><span>${f.dir ? "" : fmtSize(f.size)}</span>`;
+    d.firstChild.textContent = (f.dir ? "📂 " : "📄 ") + f.path.split("/").pop(); d.firstChild.style.paddingLeft = depth * 16 + "px";
+    if (!f.dir) d.onclick = () => viewFile(f);
+    $("flist").appendChild(d);
+  }
+}
+async function viewFile(f) {
+  const url = `/api/files/${encodeURIComponent(active)}/${f.path.split("/").map(encodeURIComponent).join("/")}`;
+  $("fv-name").textContent = f.path; $("fv-dl").href = url + "?download=1"; $("fv-dl").setAttribute("download", f.path.split("/").pop());
+  $("fv-body").textContent = "loading…"; $("fview").classList.add("on");
+  try {
+    const r = await fetch(url, { cache: "no-store" }), ct = r.headers.get("Content-Type") || "";
+    if (!ct.startsWith("text/")) { $("fv-body").textContent = `(binary file, ${fmtSize(f.size)}: use Download)`; return; }
+    const text = await r.text(), ext = (f.path.match(/\.(\w+)$/) || [])[1] || "";
+    const lang = { py: "python", js: "javascript", sh: "bash", c: "c", h: "c", cpp: "cpp", html: "xml", css: "css", json: "json", md: "markdown" }[ext];
+    const code = document.createElement("code"); code.textContent = text; if (lang) code.className = "language-" + lang;
+    $("fv-body").innerHTML = ""; $("fv-body").appendChild(code); try { hljs.highlightElement(code); } catch {}
+  } catch (e) { $("fv-body").textContent = "could not load: " + e; }
+}
+
+// ---------------------------------------------------------------- live stats (sidebar, header, monitor)
+function spark(canvas, series, colors, maxMin) {
+  const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext && canvas.getContext("2d"); if (!g) return;
+  g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const max = Math.max(maxMin, ...series.flat()) * 1.1;
+  const css = getComputedStyle(document.body);
+  g.strokeStyle = css.getPropertyValue("--line"); g.lineWidth = 1;
+  for (const y of [0.25, 0.5, 0.75]) { g.beginPath(); g.moveTo(0, h * y); g.lineTo(w, h * y); g.stroke(); }
+  series.forEach((s, k) => {
+    if (s.length < 2) return;
+    const X = (i) => (i / (s.length - 1)) * w, Y = (v) => h - (v / max) * (h - 4) - 2;
+    g.beginPath(); g.moveTo(0, h); s.forEach((v, i) => g.lineTo(X(i), Y(v))); g.lineTo(w, h); g.closePath();
+    g.fillStyle = colors[k] + "22"; g.fill();
+    g.beginPath(); s.forEach((v, i) => (i ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)))); g.strokeStyle = colors[k]; g.lineWidth = 1.8; g.stroke();
+  });
+  g.fillStyle = css.getPropertyValue("--muted"); g.font = "11px system-ui"; g.fillText(max.toFixed(max < 10 ? 1 : 0), 4, 12);
+}
+const heat = (t) => (t >= 90 ? "var(--bad)" : t >= 80 ? "var(--warn)" : "var(--good)");
+function nodeCard(n) {
+  if (!n.online) return `<div class="card"><h3>${esc(n.name)} <span class="pill warn">offline</span></h3><div class="sub">no data from this Mac</div></div>`;
+  const ram = n.ram, cores = n.cores.map((c, i) => `<div class="core"><div class="v"><i style="height:${c}%"></i></div>cpu${i} · ${c}%</div>`).join("");
+  const fanPct = n.fan_max ? Math.round(100 * n.fan_rpm / n.fan_max) : 0;
+  return `<div class="card"><h3>${esc(n.name)} <span class="sub" style="text-transform:none;letter-spacing:0">${esc(n.role)}</span></h3>
+    <div class="row"><span>CPU</span><b>${n.cpu_pct.toFixed(0)}%</b></div><div class="cores">${cores}</div>
+    <div class="row"><span>Memory</span><b>${fmtMB(ram.used_mb)} of ${fmtMB(ram.total_mb)} · ${fmtMB(ram.available_mb)} free</b></div>
+    <div class="bar"><i style="width:${(100 * ram.used_mb / ram.total_mb).toFixed(1)}%;background:#8b5cf6"></i></div>
+    <div class="row"><span>Swap</span><b>${fmtMB(n.swap.used_mb)} used</b></div>
+    <div class="row"><span>CPU temperature</span><b style="color:${heat(n.temp_cpu)}">${n.temp_cpu} °C</b></div>
+    <div class="row"><span>Fan</span><b>${n.fan_rpm} rpm (${fanPct}%)</b></div>
+    <div class="row"><span>SSD temperature</span><b>${n.temp_ssd} °C</b></div>
+    <div class="row"><span>Cable to the other Mac</span><b>↓ ${fmtBytes(n.net.rx_bps)} &nbsp; ↑ ${fmtBytes(n.net.tx_bps)}</b></div>
+    <canvas class="spark" data-node="${esc(n.name)}"></canvas>
+    <div class="row"><span>GPU clock</span><b>${n.gpu_mhz <= 350 ? "idle" : n.gpu_mhz + " MHz"}</b></div>
+    <div class="row"><span>Disk free</span><b>${n.disk.free_gb} of ${n.disk.total_gb} GB</b></div>
+    <div class="row"><span>Load · up</span><b>${n.load.toFixed(2)} · ${(n.uptime_s / 3600).toFixed(1)} h</b></div></div>`;
+}
+async function pollStats() {
+  let s;
+  try { s = await (await fetch("/api/stats", { cache: "no-store" })).json(); }
+  catch { $("sidedot").className = "dot off"; $("sidestat").textContent = "backend offline"; return; }
+  const a = s.ai, m = a.model || {};
+  modelName = m.up ? m.name : "offline";
+  const phaseTxt = { reading: "reading prompt", writing: "writing", idle: "idle", offline: "offline" }[a.phase] || a.phase;
+  $("mname").textContent = modelName; $("mkind").textContent = m.kind ? "· " + m.kind.split(" · ")[0] : "";
+  const dotCls = !a.up ? "dot off" : a.phase === "idle" ? "dot ok" : "dot busy";
+  $("mdot").className = dotCls; $("sidedot").className = dotCls;
+  if (switching && m.up) switching = false;
+  $("sidestat").textContent = !a.up ? (switching ? "switching model… (about a minute)" : "AI server offline")
+    : `${modelName} · ${phaseTxt}` + (a.phase === "writing" ? ` · ${a.gen_tps} tok/s` : "");
+  const wm = document.getElementById("wmodel"); if (wm) wm.textContent = m.up ? `Now running ${m.name}.` : "";
+  const warns = [], bits = [];
+  for (const n of s.nodes) {
+    if (!n.online) { warns.push(`${n.name} isn't responding`); continue; }
+    bits.push(`${n.name} ${n.temp_cpu}°C · ${(n.ram.available_mb / 1024).toFixed(1)} GB free`);
+    if (n.temp_cpu >= 90) warns.push(`${n.name} is hot (${n.temp_cpu} °C)`);
+    if (n.ram.available_mb < 300) warns.push(`${n.name} is almost out of memory`);
+    if (n.disk.free_gb < 5) warns.push(`${n.name}'s disk is almost full`);
+  }
+  if (!a.up && !switching) warns.push("AI server offline: run ~/cluster/start-llm.sh on node1");
+  $("health").innerHTML = bits.map(esc).join("<br>") + warns.map((w) => `<br><span class="w">⚠ ${esc(w)}</span>`).join("");
+  if (warns.length) $("sidedot").className = "dot off";
+  if (current !== "monitor") return;
+  $("m-name").textContent = modelName; $("m-kind").textContent = m.kind || ""; $("m-ctx").textContent = m.n_ctx ? `memory ${m.n_ctx.toLocaleString()} tokens · ${m.file}` : "";
+  $("m-state").textContent = phaseTxt; $("m-state").className = "pill " + (a.phase === "idle" ? "ok" : a.up ? "busy" : "warn");
+  $("s-phase").textContent = phaseTxt; $("s-phase").className = "pill " + (a.phase === "idle" ? "" : "busy");
+  if (a.phase === "writing") { $("s-big").innerHTML = `${a.gen_tps.toFixed(1)} <small>tok/s writing</small>`; $("s-sub").textContent = `${a.gen_tokens} tokens so far · prompt read at ${a.prefill_tps} tok/s`; }
+  else if (a.phase === "reading") { $("s-big").innerHTML = `${a.prompt_done ? a.prefill_tps.toFixed(1) : "…"} <small>tok/s reading</small>`; $("s-sub").textContent = `${a.prompt_done} / ${a.prompt_total} prompt tokens` + (a.cached_tokens ? ` (+${a.cached_tokens} cached)` : ""); }
+  else { $("s-big").innerHTML = `– <small>tok/s</small>`; $("s-sub").textContent = a.up ? "waiting for a question" : "server offline"; }
+  const l = a.last;
+  if (l) { $("l-pre").textContent = `${l.prompt_tokens} tokens @ ${l.prompt_tps} tok/s`; $("l-gen").textContent = `${l.gen_tokens} tokens @ ${l.gen_tps} tok/s`;
+           $("l-time").textContent = `${l.seconds}s · ended ${l.ended}`; $("l-exact").hidden = false; $("l-exact").textContent = l.exact ? "exact, from llama-server" : "estimated"; $("l-exact").className = "pill " + (l.exact ? "ok" : ""); }
+  const tt = a.totals || {};
+  $("t-req").textContent = tt.requests ?? a.requests_seen; $("t-pre").textContent = tt.prompt_tokens != null ? tt.prompt_tokens.toLocaleString() : "–";
+  $("t-gen").textContent = tt.gen_tokens != null ? tt.gen_tokens.toLocaleString() : "–"; $("t-avg").textContent = tt.avg_gen_tps ? `${tt.avg_gen_tps} tok/s` : "–";
+  spark($("c-speed"), [a.hist.gen, a.hist.prefill], ["#2563eb", "#f59e0b"], 20);
+  $("nodes").innerHTML = s.nodes.map(nodeCard).join("");
+  s.nodes.forEach((n) => { const c = document.querySelector(`canvas[data-node="${n.name}"]`); if (c && n.hist) spark(c, [n.hist.rx.map((v) => v / 1e6), n.hist.tx.map((v) => v / 1e6)], ["#06b6d4", "#8b5cf6"], 1); });
+  const rows = [];
+  for (const n of s.nodes) for (const p of n.ai_processes || []) rows.push(`<tr><td>${esc(n.name)}</td><td>${esc(p.program)}</td><td>${esc(p.framework)}</td><td>${esc(p.model || "–")}</td><td>${fmtMB(p.ram_mb)}</td><td>${p.cpu_pct}%</td></tr>`);
+  $("procs").innerHTML = rows.join("") || `<tr><td colspan="6" class="sub">no AI processes running</td></tr>`;
+
+}
+setInterval(pollStats, 1000);
+
+// ---------------------------------------------------------------- benchmarks
+const LABELS = { "gptoss20b-low": "gpt-oss-20B (low reasoning)", "gptoss20b-medium": "gpt-oss-20B (medium reasoning)", "mellum": "Mellum 2 12B Instruct",
+                 "mellum-think": "Mellum 2 12B Thinking", "qcoder7": "Qwen2.5-Coder 7B", "qcoder14": "Qwen2.5-Coder 14B" };
+let benchSel = null;
+async function loadBench() {
+  let b; try { b = await (await fetch("/api/bench", { cache: "no-store" })).json(); } catch { return; }
+  const run = b.running; $("b-running").hidden = !run;
+  if (run) { $("b-run-label").textContent = LABELS[run.label] || run.label; $("b-run-bar").style.width = (100 * run.done / run.total) + "%";
+             $("b-run-count").textContent = `${run.done}/${run.total} · ${run.passed} passed`; $("b-run-log").textContent = run.recent.join("\n"); }
+  const meter = (pct, txt, color) => pct == null ? "–" : `<div class="meter"><div class="bar"><i style="width:${pct}%;background:${color}"></i></div><b>${pct}%</b> <span class="sub">${txt}</span></div>`;
+  const rows = Object.values(b.summary).sort((x, y) => (y.write_pct + y.fix_pct) - (x.write_pct + x.fix_pct));
+  $("b-sum").innerHTML = rows.map((r) => `<tr class="click${r.label === benchSel ? " sel" : ""}" data-l="${esc(r.label)}"><td><b>${esc(LABELS[r.label] || r.label)}</b></td>
+    <td>${meter(r.write_pct, r.write, "#2563eb")}</td><td>${meter(r.fix_pct, r.fix, "#16a34a")}</td><td>${r.gen_tps ?? "–"} tok/s</td>
+    <td>${r.write_avg_s ?? "–"}s write · ${r.fix_avg_s ?? "–"}s fix</td></tr>`).join("") || `<tr><td colspan="5" class="sub">no finished runs yet</td></tr>`;
+  document.querySelectorAll("#b-sum tr.click").forEach((tr) => (tr.onclick = () => { benchSel = tr.dataset.l; loadBench(); loadDetail(benchSel); }));
+}
+async function loadDetail(label) {
+  const d = await (await fetch("/api/bench/" + encodeURIComponent(label), { cache: "no-store" })).json();
+  $("b-detail-card").hidden = false; $("b-detail-title").textContent = `${LABELS[label] || label}: every problem`;
+  const tb = $("b-detail"); tb.innerHTML = "";
+  for (const r of d.results) {
+    const tr = document.createElement("tr"); tr.className = "click";
+    tr.innerHTML = `<td class="${r.pass ? "pass" : "fail"}">${r.pass ? "✓" : "✗"}</td><td>${esc(r.id)}</td><td>${r.part === "A" ? "write code" : "fix bug"}</td>
+      <td>${r.seconds}s</td><td>${r.gen_tokens ?? "–"}</td><td>${r.tool_calls ?? "–"}</td>`;
+    tr.onclick = async () => {
+      if (tr.nextSibling?.classList?.contains("dt")) { tr.nextSibling.remove(); return; }
+      const dt = document.createElement("tr"); dt.className = "dt";
+      dt.innerHTML = `<td colspan="6"><div class="detail"><div class="sub">Model's answer</div><div class="md"></div><div class="sub" style="margin-top:10px">Test output</div><pre class="logbox"></pre></div></td>`;
+      dt.querySelector(".md").innerHTML = render(r.answer || "(empty)"); dt.querySelector(".logbox").textContent = r.log || (r.pass ? "all tests passed" : "(no output)");
+      tr.after(dt); await decorate(dt.querySelector(".md"));
+    };
+    tb.appendChild(tr);
+  }
+}
+setInterval(() => { if (current === "bench") loadBench(); }, 5000);
+
+// live feed of the running benchmark: question, thinking, tool runs, the answer as it is written, verdicts
+const BL = { offset: 0, label: "", item: null, verdicts: [] };
+function blDraw() {
+  const it = BL.item;
+  $("bl-q-title").textContent = it ? `Question ${it.q.n}/${it.q.of} · ${it.q.id} · ${it.q.part === "A" ? "write code" : "fix the bug (with tools)"}` : "Question";
+  $("bl-q").textContent = it ? it.q.text : "waiting for the next question…";
+  $("bl-think-box").hidden = !(it && it.thinking); $("bl-think").textContent = it ? it.thinking.slice(-3000) : "";
+  $("bl-tools").innerHTML = "";
+  for (const tl of it ? it.tools.slice(-2) : []) {
+    const d = document.createElement("details"); d.className = "tool"; d.open = true;
+    d.innerHTML = `<summary>🐍 ran Python · exit ${tl.exit}</summary><pre class="toolcode"></pre><pre class="toolcode"></pre>`;
+    d.querySelectorAll("pre")[0].textContent = tl.code; d.querySelectorAll("pre")[1].textContent = tl.output || "(no output)";
+    $("bl-tools").appendChild(d);
+  }
+  $("bl-a").innerHTML = it && it.answer ? render(it.answer) : `<span class="sub">${it ? "…" : ""}</span>`;
+  $("bl-a-title").textContent = it ? `Answer (live)` + (it.tps ? ` · ${it.tps} tok/s` : "") : "Answer (live)";
+  $("bl-verdicts").innerHTML = BL.verdicts.slice(-8).reverse().map((v) =>
+    `<div class="row"><span><span class="${v.pass ? "pass" : "fail"}">${v.pass ? "✓" : "✗"}</span> ${esc(v.id)}</span><b>${v.seconds}s</b></div>`).join("") || `<div class="sub">none yet</div>`;
+}
+async function blPoll() {
+  if (current !== "bench" || $("b-running").hidden) return;
+  let d; try { d = await (await fetch(`/api/bench_live?offset=${BL.offset}`, { cache: "no-store" })).json(); } catch { return; }
+  if (d.label !== BL.label) { Object.assign(BL, { label: d.label, item: null, verdicts: [] }); if (d.offset < BL.offset) BL.offset = 0; }
+  for (const e of d.events) {
+    if (e.type === "question") BL.item = { q: e, thinking: "", answer: "", tools: [], tps: null };
+    else if (!BL.item) continue;
+    else if (e.type === "thinking") BL.item.thinking += e.text;
+    else if (e.type === "token") BL.item.answer += e.text;
+    else if (e.type === "tool") { BL.item.tools.push(e); BL.item.answer = ""; BL.item.thinking = ""; }
+    else if (e.type === "timings") BL.item.tps = e.gen_tps;
+    else if (e.type === "result") { BL.verdicts.push({ id: e.id, pass: e.pass, seconds: e.seconds }); BL.item = null; }
+  }
+  BL.offset = d.offset; blDraw();
+}
+setInterval(blPoll, 1000);
+
+// ---------------------------------------------------------------- start
+show(location.hash.slice(1) || "chat"); pollStats();
+(async () => { await migrateLocal(); await loadList(); if (active && chats.find((c) => c.id === active)) await openChat(active); else { active = null; drawThread(); } })();
+</script>
+</body>
+</html>

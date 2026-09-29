@@ -1,0 +1,13 @@
+[Unit]
+Description=Low-latency cable link for two-Mac tensor parallel LLM (EEE off, no deep C-states)
+After=network-online.target cpu-performance.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ethtool --set-eee enp4s0 eee off || true; ethtool -C enp4s0 rx-usecs 1 rx-frames 1 || true; for s in /sys/devices/system/cpu/cpu*/cpuidle/state[3-9]; do echo 1 > $s/disable; done'
+ExecStop=/bin/sh -c 'for s in /sys/devices/system/cpu/cpu*/cpuidle/state[3-9]; do echo 0 > $s/disable; done'
+
+[Install]
+WantedBy=multi-user.target
