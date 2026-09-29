@@ -409,6 +409,31 @@ Rigorous peak test (gpu/peak.c) + the silicon spec settle what the ceiling actua
 - CPU+GPU stacking: impossible for generation (shared memory bus), but real for PROMPT (compute-bound): CPU 145 + GPU 64
   = ~1.4x prompt. That is the one place the iGPU genuinely helps and is worth wiring in.
 
+### The memory hierarchy: RAM vs SSD vs Ethernet (measured 2026-09-29)
+The whole cluster design is about keeping weights on the fastest path and only shipping the small pieces over the slow one.
+| path | measured speed | role |
+|---|---|---|
+| RAM (per Mac) | ~26 GB/s | holds this Mac's HALF of the weights; read every token |
+| NVMe SSD (Apple AP0128M) | ~1.8 GB/s | 14x slower than RAM -- only for models too big for RAM |
+| Ethernet cable | 0.125 GB/s (1 GbE) | carries ONLY the 4-8 KB activation sums per layer, never weights |
+| Thunderbolt (planned) | ~1-2 GB/s | same role as Ethernet, ~10x faster |
+
+**Why weights never go over Ethernet:** each Mac streams its half from its own RAM (26 GB/s) and the cable only combines
+the small per-layer results (allreduce). Shipping weights over 125 MB/s Ethernet would cap generation at ~0.15 tok/s;
+streaming them from local RAM is what makes ~22 tok/s possible.
+
+**SSD streaming (MMAP=1 in start-ep.sh):** for a model that FITS in RAM, streaming weights from SSD is a ~5x slowdown
+(0.41 GB/token / 1.8 GB/s = 228 ms/token = ~4-5 tok/s vs ~21 from RAM), so it is off by default. Its real use is
+**capacity, not speed**: it lets you run a model BIGGER than combined RAM. `MMAP=1 ./start-ep.sh <model>` memory-maps the
+weights so the OS streams the needed ones from SSD on demand and caches the hot ones. MoE models suit this best (only a
+few experts per token are read), so a ~30B-class MoE can run on 16 GB of RAM at reduced speed -- "runs at all" on trash
+hardware instead of "impossible". The right next step is a hot-experts-in-RAM / cold-experts-on-SSD cache with prefetch
+overlapping SSD reads with compute (SSD latency CAN be hidden behind compute, unlike RAM bandwidth).
+
+**GPU-from-RAM + CPU-from-SSD in parallel** (summing bandwidth): measured envelope is ~28 GB/s vs 26 RAM-only (~8%),
+and SSD DMA still consumes RAM write bandwidth, so the real gain is smaller than that. Not worth the complexity for
+RAM-fitting models; the win is capacity (above), not throughput.
+
 ### Things we learned the hard way
 
 - Use the **CPU build** as the client. The Vulkan-built client also grabs the local GPU.

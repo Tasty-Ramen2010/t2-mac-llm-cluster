@@ -33,6 +33,11 @@ case "${1:-gpt-oss}" in mellum*|qcoder*|gemma) POLL_DEF=50 ;; *) POLL_DEF=100 ;;
 # near its end only re-reads the change (otherwise, with no checkpoints, llama-server re-reads the whole chat).
 # Costs ~0.2-0.4 GB per Mac for gpt-oss/Mellum. Leader and follower must agree. Models without SWA ignore it.
 if [ "${SWA:-full}" = full ]; then SWA_L=(--swa-full); SWA_F=""; else SWA_L=(); SWA_F="--swa-small"; fi
+# MMAP=1: memory-map the weights instead of loading them into RAM with --repack. For a model that FITS in RAM this is
+# slower (no repacked kernels), but it lets you run a model BIGGER than combined RAM: the OS streams the needed weights
+# from the NVMe SSD (~1.8 GB/s here) on demand and caches the hot ones. MoE models stream best (few experts per token).
+# Expect ~4-6 tok/s when weights come from SSD vs ~20 from RAM -- the point is "runs at all", not speed.
+if [ "${MMAP:-0}" = 1 ]; then RP_L=(--no-repack); RP_F=""; else RP_L=(--repack); RP_F="--repack --no-mmap"; fi   # follower (ep-run) defaults to no-repack+mmap when given neither
 # n-gram drafting (SPEC=0 to disable): when the answer repeats text already in the chat (editing / reprinting code), the
 # next tokens are guessed from it and checked in one pass. Needs a 16-token match, guesses 16 (defaults 12/48 cost MoE
 # models ~9% on summaries). gpt-oss: code edits 16 -> 27 t/s, fresh text unchanged, summaries -2%;
@@ -65,14 +70,14 @@ sudo sh -c "$gpumax" 2>/dev/null; ssh "$NODE2" "sudo sh -c '$gpumax'" 2>/dev/nul
 # follower: replays node1's calls on its half of the model
 ssh "$NODE2" "systemctl --user stop ep-follower 2>/dev/null; systemctl --user reset-failed ep-follower 2>/dev/null; \
   systemd-run --user --unit=ep-follower --collect --setenv=LLAMA_EP_RANK=1 $(for kv in $EP; do printf -- '--setenv=%s ' "$kv"; done) \
-  /home/node2/llama.cpp/build/bin/llama-ep-run -m $M1 --ctrl $EPNET:50061 --follow -t 4 -c 16384 --repack --no-mmap $SWA_F $PIN_F ${EPF_ARGS:-} >/dev/null"
+  /home/node2/llama.cpp/build/bin/llama-ep-run -m $M1 --ctrl $EPNET:50061 --follow -t 4 -c 16384 $RP_F $SWA_F $PIN_F ${EPF_ARGS:-} >/dev/null"
 
 # leader: normal llama-server; libllama mirrors every decode/memory call to the follower.
 systemctl --user reset-failed llm-ep 2>/dev/null || true
 systemd-run --user --unit=llm-ep --collect --setenv=LLAMA_EP_RANK=0 $(for kv in $EP; do printf -- '--setenv=%s ' "$kv"; done) \
   --setenv=LLAMA_EP_CTRL=$EPNET:50061 \
   /home/node1/llama.cpp/build/bin/llama-server -m $M0 -ngl 0 -t ${T1:-3} -tb 4 \
-  -c 16384 -b 512 -ub 512 -np 1 --ctx-checkpoints 0 --cache-ram 0 --no-warmup --metrics -lm none --repack "${SWA_L[@]}" "${SPEC_L[@]}" "${PIN_L[@]}" ${EPL_ARGS:-} \
+  -c 16384 -b 512 -ub 512 -np 1 --ctx-checkpoints 0 --cache-ram 0 --no-warmup --metrics -lm none "${RP_L[@]}" "${SWA_L[@]}" "${SPEC_L[@]}" "${PIN_L[@]}" ${EPL_ARGS:-} \
   "${EXTRA[@]}" --host 100.82.180.15 --port 8080 >/dev/null
 
 sudo ufw allow in on tailscale0 to any port 8080 proto tcp comment 'llama-server via tailscale only' >/dev/null
