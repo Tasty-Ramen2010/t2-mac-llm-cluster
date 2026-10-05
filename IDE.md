@@ -60,6 +60,9 @@ Even with all of this on, the login is the real protection of the public address
 ### Why the AGX has an OOM guard
 The AGX's GPU memory is carved out of the same 28 GB as the OS and is not limited by cgroups. A runaway job (or a compile next to a 24 GB model) used to push the whole machine into the kernel OOM killer, which killed Wi-Fi, DHCP and Tailscale first. Now: network daemons run with `oom_score_adj=-1000` (`oom-protect.sh`, run at boot), the model server with +300, and `agx-guard.sh` kills agent jobs before the kernel acts. Still: do not compile big things next to the model; stop the server first.
 
+## Speed switch on the AGX
+`ssh agx /mnt/persistent/data/agx-setup/agx-perf stock|opt|opt1024` (no argument = show). `stock` is the proven build; `opt` adds the custom MoE kernel and pruned MTP draft vocabulary (same text, about +15% speed: 58.6 -> 67 tok/s); `opt1024` also uses a bigger prompt batch in the 256k profile (+22% long-prompt speed, 1.2 GB less free memory). Details and findings: `kernels/README.md`.
+
 ## Which context profile when
 - **Claude Code orchestrating** (MCP `minion_*` tools): use `fast` (64k, 2 parallel conversations) or `long` (128k). `minion_set_profile` switches in ~45 s.
 - **The 35B orchestrating with Maple minions** (`ide` terminal / `minion_agent`): use `max` (256k). This is the default on boot.
