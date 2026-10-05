@@ -59,13 +59,48 @@ IDE_TOOLS = [
             "required": ["repo"]}}},
 ]
 
+IDE_TOOLS += [
+    {"type": "function", "function": {
+        "name": "run_on_agx",
+        "description": "Run a bash command on the AGX Orin GPU computer (CUDA 11.4 with nvcc, gcc, cmake, Python 3.8, sm_87 GPU). Your "
+                       "workspace folder (or 'dir' inside it) is copied there, the command runs as an unprivileged user with NO "
+                       "network access and a hard time limit, and the files it creates or changes are copied back. Use it to "
+                       "compile and run CUDA/GPU code and benchmarks. Max 30 minutes. GPU memory is shared with the model server "
+                       "(about 3 GB is free), so keep GPU allocations under ~2 GB; jobs that use too much memory are killed.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"},
+            "dir": {"type": "string", "description": "workspace sub-folder to run in (default: the whole workspace, max 50 MB)"},
+            "timeout": {"type": "integer", "description": "seconds, default 120, max 1800"}}, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "git_push",
+        "description": "Commit all changes in a git repository in the workspace and push them to a BRANCH of the owner's GitHub repo. "
+                       "Pushing to main/master/develop/release branches is refused; pick a feature branch name. Only repositories owned "
+                       "by the configured GitHub owner(s) are allowed. Use github_pr afterwards to open a pull request.",
+        "parameters": {"type": "object", "properties": {
+            "dir": {"type": "string", "description": "repository folder in the workspace (default .)"},
+            "branch": {"type": "string", "description": "branch to push to, e.g. agent/fix-parser"},
+            "message": {"type": "string", "description": "commit message"}}, "required": ["branch", "message"]}}},
+    {"type": "function", "function": {
+        "name": "github_pr",
+        "description": "Open a pull request on one of the owner's GitHub repositories from a branch you pushed with git_push.",
+        "parameters": {"type": "object", "properties": {
+            "repo": {"type": "string", "description": "owner/name"}, "head": {"type": "string", "description": "the pushed branch"},
+            "title": {"type": "string"}, "body": {"type": "string"},
+            "base": {"type": "string", "description": "target branch (default: the repo default branch)"}}, "required": ["repo", "head", "title"]}}},
+]
+
 IDE_SYSTEM = (
     " You are the lead engineer of a small coding team. For anything beyond a few lines, split the work into small, "
     "independent pieces and use delegate_code to have fast worker models write them (give each a precise spec and a "
     "write_to file), then read their files, run the code or tests, and fix problems yourself or send a corrected spec. "
     "Do tiny edits yourself. To work on a GitHub repository (including private ones the owner has authorised) use "
     "git_clone with owner/name, then read its README and structure before changing anything. Always run the code "
-    "you or the workers wrote before saying it works."
+    "you or the workers wrote before saying it works. Your sandbox has OPEN internet access (public websites only: pip, npm, git, curl, "
+    "Hugging Face; no permission pop-ups), commands may run up to 30 minutes, and you may start servers inside the sandbox on "
+    "127.0.0.1 ports 30000-30999 (run them in the background with nohup ... &, then test with curl; stray processes are cleaned up "
+    "after about 40 minutes). For GPU/CUDA work use run_on_agx (nvcc is there; no network, files are synced back). To save work "
+    "to GitHub use git_push to a feature branch (never main) and github_pr to open a pull request. "
+    "Ignore older instructions that say only ports 80/443 exist or that there is no GPU."
 )
 
 
@@ -209,6 +244,156 @@ def planner_info(A):
     return v
 
 
+# ---------- more powers: AGX GPU jobs, GitHub push/PR, process cleanup ----------
+
+import threading
+import uuid
+
+AGX_SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new", "-p", "2223",
+           os.environ.get("IDE_AGX", "root@10.10.13.1")]
+AGX_JOB = "sh /mnt/persistent/data/agx-setup/agx-job"
+AGX_LOCK = threading.Lock()
+POLICY_FILE = CONF / "policy.json"
+PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "production", "prod", "trunk"}
+
+
+def _policy():
+    try:
+        return json.loads(POLICY_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _gh_user():
+    try:
+        p = subprocess.run(["gh", "api", "user", "-q", ".login"], capture_output=True, text=True, timeout=15)
+        return p.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def _allowed_owner(owner):
+    owners = _policy().get("allowed_owners") or [_gh_user()]
+    return owner.lower() in [o.lower() for o in owners if o]
+
+
+def run_on_agx(A, args, chat_id):
+    cmd = (args.get("command") or "").strip()
+    if not cmd:
+        return "run_on_agx: 'command' is empty."
+    timeout = max(5, min(int(args.get("timeout") or 120), 1800))
+    ws = Path(str(A.workspace(chat_id or "scratch")))
+    sub = (args.get("dir") or ".").strip()
+    if ".." in Path(sub).parts or Path(sub).is_absolute():
+        return "run_on_agx: dir must be a folder inside the workspace."
+    src = ws / sub
+    job = "j" + uuid.uuid4().hex[:10]
+    if not AGX_LOCK.acquire(timeout=30):
+        return "run_on_agx: another GPU job is running; try again in a minute."
+    t0 = time.time()
+    try:
+        size = subprocess.run(["sudo", "-n", "du", "-sk", str(src)], capture_output=True, text=True, timeout=30).stdout.split()
+        if not size:
+            return f"run_on_agx: folder {sub} not found in the workspace."
+        if int(size[0]) > 50 * 1024:
+            return f"run_on_agx: {sub} is {int(size[0]) // 1024} MB; pass a smaller 'dir' (max 50 MB)."
+        up = subprocess.run(f"sudo -n tar -c --exclude=.git -C '{src}' . | " + " ".join(AGX_SSH) + f" '{AGX_JOB} put {job}'",
+                            shell=True, capture_output=True, text=True, timeout=120)
+        if "put ok" not in up.stdout:
+            return f"run_on_agx: could not reach the AGX ({(up.stderr or up.stdout)[-200:].strip()})"
+        enc = base64.b64encode(cmd.encode())
+        run = subprocess.run(AGX_SSH + [f"{AGX_JOB} run {job} {timeout}"], input=enc, capture_output=True, timeout=timeout + 60)
+        out = run.stdout.decode("utf-8", "replace")
+        # bring changed files back into the workspace (as the sandbox user, size-capped on the AGX side)
+        tarf = tempfile.mktemp(prefix="agxget-")
+        with open(tarf, "wb") as f:
+            subprocess.run(AGX_SSH + [f"{AGX_JOB} get {job}"], stdout=f, stderr=subprocess.DEVNULL, timeout=180)
+        back = subprocess.run(["sudo", "-n", "-u", "llmtools", "tar", "-x", "-C", str(src), "--no-same-owner", "--no-absolute-names",
+                               "-f", tarf, "--keep-newer-files"], capture_output=True, text=True, timeout=120)
+        os.unlink(tarf)
+        subprocess.run(AGX_SSH + [f"{AGX_JOB} rm {job}"], capture_output=True, timeout=30)
+        note = "" if back.returncode == 0 else f" (copy-back warning: {back.stderr[-120:].strip()})"
+        return f"{_clip(out, 7000).rstrip()}\n[AGX job {time.time() - t0:.0f}s, files synced back to ./{sub}]{note}"
+    except subprocess.TimeoutExpired:
+        return "run_on_agx: timed out."
+    except Exception as e:
+        return f"run_on_agx failed: {e}"
+    finally:
+        AGX_LOCK.release()
+
+
+def _repo_of(gitdir):
+    p = subprocess.run(["sudo", "-n", "-u", "llmtools", "git", "-c", "safe.directory=*", "-C", str(gitdir), "remote", "get-url", "origin"],
+                       capture_output=True, text=True, timeout=30)
+    m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$", p.stdout.strip())
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def git_push(A, args, chat_id):
+    branch = (args.get("branch") or "").strip()
+    msg = (args.get("message") or "").strip()
+    if not REF_RE.match(branch) or not msg:
+        return "git_push: give a valid branch name and a commit message."
+    if branch.lower() in PROTECTED_BRANCHES or branch.lower().startswith("release") or branch.lower().startswith("refs/"):
+        return f"git_push: pushing to '{branch}' is not allowed. Use a feature branch (for example agent/{re.sub('[^A-Za-z0-9._-]+', '-', msg.lower())[:30]}) and open a pull request."
+    ws = Path(str(A.workspace(chat_id or "scratch")))
+    sub = (args.get("dir") or ".").strip()
+    if ".." in Path(sub).parts or Path(sub).is_absolute():
+        return "git_push: dir must be inside the workspace."
+    d = ws / sub
+    owner, name = _repo_of(d)
+    if not owner:
+        return "git_push: that folder is not a git repository with a github.com 'origin' remote (use git_clone first)."
+    if not _allowed_owner(owner):
+        return f"git_push: pushing to {owner}/{name} is not allowed (only repositories owned by the configured GitHub owner)."
+    token = _token()
+    if not token:
+        return "git_push: no GitHub login is configured on the server."
+    login = _gh_user() or owner
+    ident = ["-c", f"user.name=Cluster IDE agent", "-c", f"user.email={login}@users.noreply.github.com", "-c", "safe.directory=*"]
+    llm = ["sudo", "-n", "-u", "llmtools", "env", "HOME=/home/llmtools", "git"] + ident + ["-C", str(d)]
+    subprocess.run(llm + ["add", "-A"], capture_output=True, text=True, timeout=120)
+    c = subprocess.run(llm + ["commit", "-m", msg + "\n\nAuthored by the cluster IDE agent (local Qwen3.6-35B-A3B + Maple workers)."],
+                       capture_output=True, text=True, timeout=120)
+    if c.returncode != 0 and "nothing to commit" not in (c.stdout + c.stderr):
+        return f"git_push: commit failed: {_clip(c.stdout + c.stderr, 400)}"
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    p = subprocess.run(["git", "-c", "safe.directory=*", "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}",
+                        "-C", str(d), "push", f"https://github.com/{owner}/{name}.git", f"HEAD:refs/heads/{branch}"],
+                       capture_output=True, text=True, timeout=300, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    err = re.sub(r"basic [A-Za-z0-9+/=]+", "basic ***", p.stderr)
+    if p.returncode != 0:
+        return f"git_push failed: {_clip(err, 600)}"
+    return f"Pushed to {owner}/{name} branch '{branch}'.\n{_clip(err, 400)}\nOpen a pull request with github_pr(repo='{owner}/{name}', head='{branch}', title=...)."
+
+
+def github_pr(A, args, chat_id):
+    repo = (args.get("repo") or "").strip()
+    if not REPO_RE.match(repo) or not REF_RE.match(args.get("head") or ""):
+        return "github_pr: give repo as owner/name and a valid head branch."
+    if not _allowed_owner(repo.split("/")[0]):
+        return "github_pr: only repositories owned by the configured GitHub owner are allowed."
+    cmd = ["gh", "pr", "create", "--repo", repo, "--head", args["head"], "--title", args["title"], "--body", args.get("body") or "Created by the cluster IDE agent."]
+    if args.get("base"):
+        cmd += ["--base", args["base"]]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return (p.stdout.strip() or p.stderr.strip())[:800]
+
+
+def _reaper():
+    """Kill sandbox processes (user llmtools) that have been running for more than 40 minutes: leftovers of background servers."""
+    while True:
+        time.sleep(180)
+        try:
+            out = subprocess.run(["ps", "-u", "llmtools", "-o", "pid=,etimes=,comm="], capture_output=True, text=True, timeout=20).stdout
+            for line in out.splitlines():
+                pid, et, comm = line.split(None, 2)
+                if int(et) > 2400 and comm.strip() not in ("systemd", "(sd-pam)"):
+                    subprocess.run(["sudo", "-n", "kill", "-9", pid], capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+
 # ---------- install ----------
 
 def install(A):
@@ -218,6 +403,11 @@ def install(A):
     A._ide_installed = True
     A.TOOLS.extend(IDE_TOOLS)
     A.SYSTEM = A.SYSTEM + IDE_SYSTEM
+    for t in A.TOOLS:                                   # the sandbox now allows 30-minute commands (see SANDBOX_MAX_TIMEOUT)
+        if t["function"]["name"] == "run_shell":
+            t["function"]["description"] = t["function"]["description"].replace("max 600", "max 1800")
+            t["function"]["parameters"]["properties"]["timeout"]["description"] = "seconds, default 120, max 1800"
+    threading.Thread(target=_reaper, daemon=True).start()
     orig_call_tool = A.call_tool
 
     def call_tool(name, args, chat_id=None, token=None):
@@ -226,6 +416,12 @@ def install(A):
                 return delegate_code(A, args, chat_id)
             if name == "git_clone":
                 return git_clone(A, args, chat_id)
+            if name == "run_on_agx":
+                return run_on_agx(A, args, chat_id)
+            if name == "git_push":
+                return git_push(A, args, chat_id)
+            if name == "github_pr":
+                return github_pr(A, args, chat_id)
         except Exception as e:                       # never crash the chat loop
             return f"Tool error: {e}"
         return orig_call_tool(name, args, chat_id, token)

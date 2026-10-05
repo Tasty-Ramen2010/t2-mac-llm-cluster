@@ -29,7 +29,9 @@ CONF_FILE = Path(os.environ.get("MINIONS_CONFIG", str(Path.home() / ".config" / 
 DEFAULTS = {"mode": "big+maple",
             "big_url": "http://100.92.90.4:8080",          # AGX planner (OpenAI-compatible llama-server) on the tailnet
             "maple_url": "http://100.82.180.15:8095",      # Maple router on node1 (tailnet)
-            "agent_url": "http://100.82.180.15:8081"}      # cluster IDE agent on node1 (tailnet)
+            "agent_url": "http://100.82.180.15:8081",      # cluster IDE agent on node1 (tailnet)
+            "agx_ssh": "root@100.92.90.4",                 # to switch the AGX context profile (ssh key auth, port 2223)
+            "agx_ssh_port": "2223"}
 MODES = ("off", "big", "big+maple")
 SERVER_INFO = {"name": "minions", "version": "1.0.0"}
 INSTRUCTIONS = ("Local 'minion' models you can delegate to to save time and tokens. Use minion_code for self-contained code "
@@ -99,7 +101,11 @@ def need(mode_ok, tool):
 
 def t_status(a):
     c = cfg()
-    out = [f"mode: {c['mode']}"]
+    n_ctx, slots = _props(c)
+    prof = {65536: "fast (64k x2)", 131072: "long (128k)", 262144: "max (256k)"}.get(n_ctx * max(slots, 1), f"custom ({n_ctx * max(slots, 1)} total)")
+    out = [f"mode: {c['mode']}",
+           f"AGX context profile: {prof}  [per conversation {n_ctx} tokens, {slots} slot(s)]",
+           "recommended: Claude Code orchestrating -> fast or long; the 35B orchestrating (minion_agent / `ide`) -> max. Switch with minion_set_profile (~40 s)."]
     for name, base, path in (("big (AGX planner)", c["big_url"], "/v1/models"), ("maple (workers)", c["maple_url"], "/__router"),
                              ("agent (cluster IDE)", c["agent_url"], "/api/model")):
         try:
@@ -116,6 +122,44 @@ def t_status(a):
         except Exception as e:
             out.append(f"{name}: DOWN  {base}  ({getattr(e, 'reason', e)})")
     return "\n".join(out)
+
+
+PROFILES = {"fast": "64k context, 2 parallel conversations (best when Claude Code orchestrates and fires several minion calls)",
+            "long": "128k context, 1 conversation (Claude Code orchestrating with big documents)",
+            "max": "256k context, 1 conversation (best when the 35B itself orchestrates with Maple workers: minion_agent / the `ide` terminal)"}
+
+
+def _props(c):
+    try:
+        d = http_json(c["big_url"].rstrip("/") + "/props", timeout=6)
+        g = d.get("default_generation_settings") or {}
+        return g.get("n_ctx") or 0, d.get("total_slots") or 0
+    except Exception:
+        return 0, 0
+
+
+def t_set_profile(a):
+    p = (a.get("profile") or "").strip().lower()
+    if p not in PROFILES:
+        return "profile must be one of: " + "; ".join(f"{k} = {v}" for k, v in PROFILES.items())
+    c = cfg()
+    import subprocess
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
+                        "-p", str(c["agx_ssh_port"]), c["agx_ssh"], f"sh /mnt/persistent/data/agx-setup/agx-profile {p}"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return f"could not reach the AGX over ssh: {(r.stderr or r.stdout).strip()[-200:]}"
+    deadline = time.time() + 180
+    time.sleep(8)
+    while time.time() < deadline:
+        try:
+            if http_json(c["big_url"].rstrip("/") + "/health", timeout=4).get("status") == "ok":
+                break
+        except Exception:
+            pass
+        time.sleep(4)
+    n_ctx, slots = _props(c)
+    return f"AGX profile is now '{p}': {PROFILES[p]}. Server reports n_ctx per conversation = {n_ctx}, slots = {slots}."
 
 
 def t_set_mode(a):
@@ -243,6 +287,9 @@ TOOLS = {
                       {"type": "object", "properties": {}}),
     "minion_set_mode": (t_set_mode, "Switch minion mode: 'off' (Claude alone), 'big' (only the AGX big model), 'big+maple' (big model and Maple workers).",
                         {"type": "object", "properties": {"mode": {"type": "string", "enum": list(MODES)}}, "required": ["mode"]}),
+    "minion_set_profile": (t_set_profile, "Switch the AGX big model's context profile (restarts it, ~40 s): 'fast' = 64k x 2 conversations, 'long' = 128k, "
+                                          "'max' = 256k. Use fast/long when Claude Code is the orchestrator, max when the 35B orchestrates the Maple minions.",
+                           {"type": "object", "properties": {"profile": {"type": "string", "enum": list(PROFILES)}}, "required": ["profile"]}),
     "minion_ask": (t_ask, "Ask the big local model (Qwen3.6-35B-A3B on the AGX, ~60 tok/s). Good for bulk summarising, drafting, "
                           "explaining code, brainstorming, second opinions. Not as strong as you: verify important answers.",
                    {"type": "object", "properties": {"prompt": {"type": "string"}, "system": {"type": "string"},

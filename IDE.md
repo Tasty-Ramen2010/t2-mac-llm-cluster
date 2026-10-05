@@ -44,10 +44,30 @@ Switch on the AGX with `ssh agx /mnt/persistent/data/agx-setup/agx-profile fast|
 Generation uses MTP speculative decoding (~61 tok/s on code, 2 drafted tokens, 93% accepted). Memory is the hard limit (28 GB shared by CPU+GPU): the 256k limit comes from KV cache + attention buffers + the MTP draft context, which is why the long profiles use quantised caches and a smaller batch. Never experiment without a memory watchdog: when the kernel runs out of memory it kills Wi-Fi/Tailscale first.
 Maple workers run 64k unified context (32k per busy conversation) with an 8-bit KV cache.
 
+
+## What the AI agent can do (powers and guard rails)
+| power | how it works | limits that stay on |
+|---|---|---|
+| **Open internet** | the sandbox reaches any public website through the gate (`permissions.json`: `"open": true`); pip, npm, git, curl, Hugging Face work with no pop-ups | only TCP 80/443; private, LAN, Tailscale and loopback addresses are always refused; the firewall still allows the sandbox nothing but the gate |
+| **Bigger limits** | commands up to 30 min, 3 GB address space, 1024 processes, 4 GB per file (`SANDBOX_*` env) | unprivileged user, no sudo; the mini's disk is nearly full (about 7 GB free), so big downloads need care |
+| **Local servers** | the sandbox may run and test its own servers on `127.0.0.1:30000-30999` | stray sandbox processes older than 40 minutes are killed |
+| **GitHub** | `git_push` (commit + push to a feature branch) and `github_pr`, using node1's `gh` login; the token never reaches the model | refuses `main/master/develop/release*` and any repo not owned by the allowed owner(s) (`~/.config/ide/policy.json` `{"allowed_owners": [...]}`; default = the gh user) |
+| **AGX GPU** | `run_on_agx`: copies the workspace to the AGX, runs the command as user `agentx` inside the Ubuntu chroot (CUDA 11.4, nvcc), copies changed files back | NO network, hard time limit (<= 30 min), one job at a time, memory guard (`agx-guard.sh` kills the user's processes if free memory < 1.8 GB), 50 MB workspace cap |
+
+Apply the edits these need in `agent_server.py` / `netgate.py` / the firewall script with `python3 tools/apply_ide_patches.py [--open]` (idempotent).
+Even with all of this on, the login is the real protection of the public address: keep the authenticator code on.
+
+### Why the AGX has an OOM guard
+The AGX's GPU memory is carved out of the same 28 GB as the OS and is not limited by cgroups. A runaway job (or a compile next to a 24 GB model) used to push the whole machine into the kernel OOM killer, which killed Wi-Fi, DHCP and Tailscale first. Now: network daemons run with `oom_score_adj=-1000` (`oom-protect.sh`, run at boot), the model server with +300, and `agx-guard.sh` kills agent jobs before the kernel acts. Still: do not compile big things next to the model; stop the server first.
+
+## Which context profile when
+- **Claude Code orchestrating** (MCP `minion_*` tools): use `fast` (64k, 2 parallel conversations) or `long` (128k). `minion_set_profile` switches in ~45 s.
+- **The 35B orchestrating with Maple minions** (`ide` terminal / `minion_agent`): use `max` (256k). This is the default on boot.
+
 ## Claude Code integration (MCP): `minions/minions_mcp.py`
 Lets Claude Code (or any MCP client) be the orchestrator and hand work to the minions. Pure standard library.
 - Install: `claude mcp add minions --scope user -- python3 /path/to/minions_mcp.py` (needs the Mac to be on the tailnet; endpoints in `~/.config/minions/config.json`).
-- Tools: `minion_status`, `minion_set_mode`, `minion_ask` (big AGX model), `minion_code` (Maple worker, optional `write_to` local file), `minion_agent` (full cluster agent: plans, delegates, runs and tests in the sandbox, returns answer + files).
+- Tools: `minion_status`, `minion_set_mode`, `minion_set_profile`, `minion_ask` (big AGX model), `minion_code` (Maple worker, optional `write_to` local file), `minion_agent` (full cluster agent: plans, delegates, runs and tests in the sandbox, returns answer + files).
 - **Modes** (`minion_set_mode` or `python3 minions_mcp.py mode <m>`): `off` = Claude works alone, `big` = only the big model, `big+maple` = everything.
 
 ## One-time setup
