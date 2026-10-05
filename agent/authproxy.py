@@ -40,7 +40,7 @@ SCRYPT = dict(n=2 ** 14, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
 ALLOW_GET = ("/api/chat_events", "/api/model", "/api/models", "/api/chats", "/api/files/", "/api/permissions",
              "/api/usage", "/api/context/", "/api/stats", "/api/jobs")
 ALLOW_POST = ("/api/chat_start", "/api/chat_cancel", "/api/permission", "/api/permissions/revoke", "/api/chats/")
-PUBLIC_FILES = {"/ide/ide_client.py": "ide_client.py"}            # bootstrap only; everything else needs a login
+PUBLIC_FILES = {"/ide/ide_client.py": "ide_client.py", "/ide.pyz": "ide.pyz"}   # the app itself holds no secrets; the API needs a login
 PRIVATE_FILES = {"/ide/ai_term.py": "ai_term.py"}
 
 LOCK = threading.Lock()
@@ -144,7 +144,7 @@ def record_fail(ip):
 # ---------- HTTP ----------
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.0"          # responses end by closing the connection: simple, and streaming just works
+    protocol_version = "HTTP/1.1"          # standard HTTP for Cloudflare/Funnel; every response closes the connection
     server_version = "ide-auth"
     sys_version = ""
 
@@ -164,8 +164,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_bytes(self, data, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -181,17 +191,21 @@ class Handler(BaseHTTPRequestHandler):
         p = self.path_only()
         if p == "/healthz":
             return self.send_json(200, {"ok": True})
+        if p == "/i":                                   # one-line installer: curl -sL https://HOST/i | python3
+            host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or ""
+            base = "https://" + host.split(",")[0].strip()
+            try:
+                data = (AGENT_DIR / "ide_bootstrap.py").read_text().replace("@@BASE@@", base).encode()
+            except OSError:
+                return self.send_json(404, {"error": "not found"})
+            return self.send_bytes(data, "text/x-python; charset=utf-8")
         if p in PUBLIC_FILES or (p in PRIVATE_FILES and valid_session(self.bearer())):
             f = AGENT_DIR / {**PUBLIC_FILES, **PRIVATE_FILES}[p]
             try:
                 data = f.read_bytes()
             except OSError:
                 return self.send_json(404, {"error": "not found"})
-            self.send_response(200)
-            self.send_header("Content-Type", "text/x-python; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            return self.wfile.write(data)
+            return self.send_bytes(data, "application/octet-stream" if p.endswith(".pyz") else "text/x-python; charset=utf-8")
         self.proxy("GET", ALLOW_GET)
 
     def do_POST(self):
@@ -262,17 +276,28 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, http.client.HTTPException) as e:
             return self.send_json(502, {"error": f"agent unreachable: {e}"})
         self.send_response(resp.status)
+        has_len = resp.getheader("Content-Length") is not None
         for k in ("Content-Type", "Content-Length", "Cache-Control", "Content-Disposition"):
             v = resp.getheader(k)
             if v:
                 self.send_header(k, v)
+        if not has_len:
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
         self.end_headers()
         try:
             while True:
                 chunk = resp.read1(65536)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                if has_len:
+                    self.wfile.write(chunk)
+                else:
+                    self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                self.wfile.flush()
+            if not has_len:
+                self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
         except (OSError, http.client.HTTPException):
             pass
@@ -282,18 +307,28 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---------- CLI ----------
 
-def cmd_init():
+def cmd_init(argv=()):
+    """init [--passphrase P] [--allow-short]: the second factor (authenticator code) is always required, which is what
+    keeps a short passphrase safe; --allow-short lets you choose one under 12 characters."""
     HOME.mkdir(parents=True, exist_ok=True)
     os.chmod(HOME, 0o700)
-    if AUTH_FILE.exists() and input("Login is already configured. Replace it? [y/N] ").strip().lower() != "y":
-        return
-    while True:
-        a = getpass.getpass("Choose a passphrase (12+ characters): ")
-        if len(a) < 12:
-            print("Too short."); continue
-        if a != getpass.getpass("Again: "):
-            print("Does not match."); continue
-        break
+    a = None
+    argv = list(argv)
+    if "--passphrase" in argv:
+        a = argv[argv.index("--passphrase") + 1]
+    allow_short = "--allow-short" in argv
+    if a is None:
+        if AUTH_FILE.exists() and input("Login is already configured. Replace it? [y/N] ").strip().lower() != "y":
+            return
+        while True:
+            a = getpass.getpass("Choose a passphrase (12+ characters): ")
+            if len(a) < 12 and not allow_short:
+                print("Too short."); continue
+            if a != getpass.getpass("Again: "):
+                print("Does not match."); continue
+            break
+    elif len(a) < 12 and not allow_short:
+        sys.exit("passphrase too short (use --allow-short; the authenticator code still protects the login)")
     salt = os.urandom(16)
     secret = base64.b32encode(os.urandom(20)).decode().rstrip("=")
     AUTH_FILE.write_text(json.dumps({"salt": base64.b64encode(salt).decode(), "hash": base64.b64encode(hash_pass(a, salt)).decode(),
@@ -321,7 +356,7 @@ def serve():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "init":
-        cmd_init()
+        cmd_init(sys.argv[2:])
     elif cmd == "serve":
         serve()
     elif cmd == "status":

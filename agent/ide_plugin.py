@@ -130,10 +130,18 @@ def delegate_code(A, args, chat_id):
 # ---------- git_clone ----------
 
 def _token():
+    """Server-side GitHub token: ~/.config/ide/github_token if present, else this machine's `gh` login. Never shown to the model."""
     try:
         return TOKEN_FILE.read_text().strip()
     except OSError:
-        return ""
+        pass
+    try:
+        p = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+        if p.returncode == 0:
+            return p.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ""
 
 
 def git_clone(A, args, chat_id):

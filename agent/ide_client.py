@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""ide: the terminal coding agent. Works from any machine with Python 3.8+ (Linux, macOS, WSL) and the `rich` package.
+"""ide: the terminal coding agent. One self-contained file (ide.pyz) from your server; needs only Python 3.8+.
 
-It logs in to your cluster IDE (passphrase + authenticator code), then runs the cluster's own `ai` terminal UI against it:
-a planner model (Qwen3.6-35B-A3B) that delegates code to fast worker models, with a sandboxed workspace, files, tests and
-private GitHub clones. Nothing is stored on this machine except a login token (~/.ide/session.json, expires in 12 h).
+It logs in to your cluster IDE (passphrase + authenticator code), then runs the cluster's `ai` terminal UI against it:
+a planner model (Qwen3.6-35B-A3B on the AGX GPU) that delegates code to fast worker models, with a sandboxed workspace on
+the cluster, files, tests and private GitHub clones. Nothing is stored here except a login token (~/.ide/session.json, 12 h).
 
-first time:   curl -fsSL https://YOUR-HOST/ide/ide_client.py -o ide_client.py && python3 ide_client.py --url https://YOUR-HOST
-afterwards:   python3 ide_client.py            (--logout to forget the token, --url to change server)
+install:   curl -sL https://YOUR-HOST/i | python3          (creates the short command `ide`)
+use:       ide            ide --logout            ide --update            ide --url https://OTHER-HOST
+networks that break HTTPS checks (school/corporate inspection):  ide --insecure   (last resort)
 """
 import argparse
 import getpass
-import http.client
 import importlib.util
 import json
 import os
+import ssl
 import sys
 import threading
 import time
@@ -25,6 +26,9 @@ from pathlib import Path
 
 HOME = Path.home() / ".ide"
 CONF = HOME / "session.json"
+UA = "Mozilla/5.0 (X11; Linux x86_64) ide-client/2"
+CTX = None          # set to an unverified context by --insecure
+OPENER = None       # built in main(): honours the system / environment proxy settings
 
 
 def load():
@@ -41,23 +45,39 @@ def save(d):
     os.chmod(CONF, 0o600)
 
 
+def make_opener():
+    handlers = [urllib.request.ProxyHandler(urllib.request.getproxies())]      # system proxy (PAC-less), env vars
+    if CTX is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=CTX))
+    return urllib.request.build_opener(*handlers)
+
+
+def open_url(req, timeout=30):
+    global OPENER
+    if OPENER is None:
+        OPENER = make_opener()
+    return OPENER.open(req, timeout=timeout)
+
+
 def post(url, path, body):
-    req = urllib.request.Request(url + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    req = urllib.request.Request(url + path, json.dumps(body).encode(), {"Content-Type": "application/json", "User-Agent": UA})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with open_url(req) as r:
             return r.status, json.load(r)
     except urllib.error.HTTPError as e:
         try:
             return e.code, json.load(e)
         except ValueError:
             return e.code, {"error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        sys.exit(f"Cannot reach {url}: {getattr(e, 'reason', e)}\n(if this network blocks it or inspects HTTPS, try --insecure; otherwise check the address)")
 
 
 def login(url):
     print(f"Logging in to {url}")
-    for attempt in range(3):
-        passphrase = getpass.getpass("Passphrase: ")
-        code = input("Authenticator code (6 digits): ").strip().replace(" ", "")
+    for _ in range(3):
+        passphrase = os.environ.get("IDE_PASSPHRASE") or getpass.getpass("Passphrase: ")      # env vars: scripted logins/tests
+        code = (os.environ.get("IDE_CODE") or input("Authenticator code (6 digits): ")).strip().replace(" ", "")
         status, resp = post(url, "/auth/login", {"passphrase": passphrase, "code": code})
         if status == 200:
             return {"url": url, "token": resp["token"], "expires": time.time() + resp.get("expires_in", 43200) - 60}
@@ -70,103 +90,119 @@ def login(url):
 class Shim(BaseHTTPRequestHandler):
     """Local plain-HTTP face for the terminal UI: forwards every request to the server and adds the login token."""
     protocol_version = "HTTP/1.0"
-    remote = None          # (scheme, host, port)
+    base = ""
     token = ""
 
     def log_message(self, *a):
         pass
 
     def forward(self):
-        scheme, host, port = self.remote
         n = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(n) if n else None
-        cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        headers = {"Authorization": "Bearer " + self.token, "User-Agent": UA}
+        if body is not None:
+            headers["Content-Type"] = self.headers.get("Content-Type", "application/json")
+        req = urllib.request.Request(self.base + self.path, data=body, headers=headers, method=self.command)
         try:
-            conn = cls(host, port, timeout=1800)
-            headers = {"Authorization": "Bearer " + self.token}
-            if body is not None:
-                headers["Content-Type"] = self.headers.get("Content-Type", "application/json")
-            conn.request(self.command, self.path, body, headers)
-            resp = conn.getresponse()
-        except (OSError, http.client.HTTPException) as e:
-            msg = json.dumps({"error": f"cannot reach the server: {e}"}).encode()
+            resp = open_url(req, timeout=1800)
+        except urllib.error.HTTPError as e:
+            resp = e                                   # an HTTP error is still a response to relay
+        except (urllib.error.URLError, OSError) as e:
+            msg = json.dumps({"error": f"cannot reach the server: {getattr(e, 'reason', e)}"}).encode()
             self.send_response(502); self.send_header("Content-Length", str(len(msg))); self.end_headers(); self.wfile.write(msg)
             return
-        self.send_response(resp.status)
+        code = getattr(resp, "status", None) or resp.code
+        self.send_response(code)
         for k in ("Content-Type", "Content-Length", "Cache-Control", "Content-Disposition"):
-            v = resp.getheader(k)
+            v = resp.headers.get(k)
             if v:
                 self.send_header(k, v)
         self.end_headers()
+        read = getattr(resp, "read1", None) or resp.read
         try:
             while True:
-                chunk = resp.read1(65536)
+                chunk = read(65536)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except (OSError, http.client.HTTPException):
+        except (OSError, ValueError):
             pass
         finally:
-            conn.close()
+            resp.close()
 
     do_GET = do_POST = forward
 
 
+def OPENER_RESET():
+    global OPENER
+    OPENER = None
+
+
+def take_keyboard_back():
+    """Started via `curl | python3`? stdin is the pipe; point it at the terminal so prompts work."""
+    if not sys.stdin.isatty():
+        try:
+            os.dup2(os.open("/dev/tty", os.O_RDWR), 0)
+            sys.stdin = open(0, closefd=False)
+        except OSError:
+            pass
+
+
+def update(url):
+    pyz = Path(sys.argv[0]).resolve() if sys.argv[0].endswith(".pyz") else HOME / "ide.pyz"
+    req = urllib.request.Request(url + "/ide.pyz", headers={"User-Agent": UA})
+    with open_url(req, timeout=120) as r:
+        data = r.read()
+    pyz.write_bytes(data)
+    print(f"Updated {pyz} ({len(data) // 1024} KB).")
+
+
 def main():
+    global CTX
     ap = argparse.ArgumentParser(description="terminal coding agent for your cluster")
-    ap.add_argument("--url", help="server address, e.g. https://agx.tailxxxx.ts.net")
+    ap.add_argument("--url", help="server address, e.g. https://xxxx.trycloudflare.com")
     ap.add_argument("--logout", action="store_true", help="forget the saved login")
+    ap.add_argument("--update", action="store_true", help="download the newest client")
+    ap.add_argument("--insecure", action="store_true", help="skip HTTPS certificate checks (last resort on inspected networks)")
     args, rest = ap.parse_known_args()
+    if args.insecure or os.environ.get("IDE_INSECURE"):
+        CTX = ssl._create_unverified_context()
+    OPENER_RESET()
+    take_keyboard_back()
     cfg = load()
+    url = (args.url or os.environ.get("IDE_URL") or cfg.get("url") or "").rstrip("/")
     if args.logout:
-        if cfg.get("url") and cfg.get("token"):
+        if url and cfg.get("token"):
             try:
-                req = urllib.request.Request(cfg["url"] + "/auth/logout", b"{}", {"Authorization": "Bearer " + cfg["token"], "Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=10).read()
+                open_url(urllib.request.Request(url + "/auth/logout", b"{}", {"Authorization": "Bearer " + cfg["token"], "Content-Type": "application/json", "User-Agent": UA}), 10).read()
             except (OSError, urllib.error.URLError):
                 pass
-        CONF.unlink(missing_ok=True)
+        cfg.pop("token", None)
+        save(cfg)
         print("Logged out.")
         return
-    url = (args.url or os.environ.get("IDE_URL") or cfg.get("url") or "").rstrip("/")
     if not url:
-        sys.exit("Give the server address once:  python3 ide_client.py --url https://YOUR-HOST")
+        sys.exit("No server saved yet. Install with:  curl -sL https://YOUR-HOST/i | python3")
+    if args.update:
+        return update(url)
     if cfg.get("url") != url or cfg.get("expires", 0) < time.time() or not cfg.get("token"):
         cfg = login(url)
         save(cfg)
-    try:
-        import rich  # noqa: F401
-    except ImportError:
-        sys.exit("The terminal UI needs the 'rich' package:  python3 -m pip install --user rich")
-
-    # fetch the matching terminal UI from the server (needs the login), so client and server always agree
-    req = urllib.request.Request(url + "/ide/ai_term.py", headers={"Authorization": "Bearer " + cfg["token"]})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            code = r.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            CONF.unlink(missing_ok=True)
-            sys.exit("Login expired. Run again to log in.")
-        sys.exit(f"Could not download the terminal UI: HTTP {e.code}")
-    HOME.mkdir(parents=True, exist_ok=True)
-    mod_path = HOME / "ai_term_remote.py"
-    mod_path.write_bytes(code)
 
     u = urllib.parse.urlsplit(url)
-    Shim.remote = (u.scheme, u.hostname, u.port or (443 if u.scheme == "https" else 80))
-    Shim.token = cfg["token"]
+    Shim.base, Shim.token = url, cfg["token"]
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Shim)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     os.environ["CLUSTER_AI_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
-
-    spec = importlib.util.spec_from_file_location("ai_term_remote", mod_path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.argv = ["ide"] + rest
-    spec.loader.exec_module(mod)
     try:
-        mod.main()
+        import rich  # noqa: F401
+        import ai_term                               # bundled in ide.pyz (reads CLUSTER_AI_URL when imported)
+    except ImportError:
+        sys.exit("The terminal UI needs the 'rich' package and ai_term.py (use the installer: curl -sL https://YOUR-HOST/i | python3)")
+    sys.argv = ["ide"] + rest
+    try:
+        ai_term.main()
     finally:
         srv.shutdown()
 
